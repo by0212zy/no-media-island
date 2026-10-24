@@ -186,6 +186,9 @@ public class NoMediaIsland extends XposedModule {
 
         // (6) 隐藏 App 裸通知那一行（行仍渲染→状态栏图标保留）
         hookHideRawMediaRow(cl);
+
+        // (7) 强制标准轮播的宿主可见（探针：MediaHostStateHolder / MediaHost 的 getVisible）
+        hookForceCarouselVisible(cl);
     }
 
     /**
@@ -392,6 +395,41 @@ public class NoMediaIsland extends XposedModule {
             log(Log.INFO, TAG, "deoptimize island intake -> " + deoptimize(m));
         } catch (Throwable t) {
             log(Log.WARN, TAG, "block island data intake failed: " + t);
+        }
+    }
+
+    /**
+     * 强制标准轮播（{@code MediaCarouselController}）的宿主可见。
+     *
+     * <p>前面已确认：3.0.3 里 QS 媒体宿主、{@code MediaHierarchyManager}、
+     * {@code MediaCarouselController} 及其 MediaData 监听都完整存在且在收数据，
+     * 且排除「岛占用」这一原因（v1.9 已验证）。所以最后只剩宿主被判定为不可见。
+     *
+     * <p>这里把 {@code MediaHostStateHolder.getVisible()} 与 {@code MediaHost.getVisible()}
+     * 都强制返回 true，让 {@code updateViewVisibility()} 把轮播视图显示出来。
+     */
+    private void hookForceCarouselVisible(ClassLoader cl) {
+        String[][] specs = {
+                {"com.android.systemui.media.controls.ui.view.MediaHost$MediaHostStateHolder",
+                        "getVisible"},
+                {"com.android.systemui.media.controls.ui.view.MediaHost", "getVisible"},
+        };
+        for (String[] spec : specs) {
+            try {
+                Class<?> c = Class.forName(spec[0], false, cl);
+                Method m = c.getDeclaredMethod(spec[1]);
+                hook(m)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept((XposedInterface.Chain chain) -> {
+                            log(Log.INFO, TAG, "[carousel] force " + spec[1] + "=true");
+                            return Boolean.TRUE;
+                        });
+                log(Log.INFO, TAG, "hooked " + spec[0].substring(spec[0].lastIndexOf('.') + 1)
+                        + "." + spec[1] + " (forced visible)");
+                log(Log.INFO, TAG, "deoptimize " + spec[1] + " -> " + deoptimize(m));
+            } catch (Throwable t) {
+                log(Log.WARN, TAG, "force visible failed: " + spec[0] + "." + spec[1] + " (" + t + ")");
+            }
         }
     }
 
