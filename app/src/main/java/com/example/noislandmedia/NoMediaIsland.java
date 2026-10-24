@@ -178,8 +178,8 @@ public class NoMediaIsland extends XposedModule {
             log(Log.ERROR, TAG, "hook failed: " + t);
         }
 
-        // (4) 隐藏「丑的原始通知行」：保留 MediaData 美化卡 + 状态栏图标（对齐 2.0.212）
-        hookHideRawMediaRow(cl);
+        // (4) 停用 3.0.3 独有的「系统媒体卡」组件（2.0.212 根本没有它）→ 回落 2.0.212 行为
+        hookDisableSystemMediaCard(cl);
     }
 
     /**
@@ -238,73 +238,54 @@ public class NoMediaIsland extends XposedModule {
     }
 
     /**
-     * 隐藏 3.0.3 里「未美化的原始通知行」，只保留美化卡 + 状态栏图标（对齐 2.0.212）。
+     * 停用 3.0.3 独有的「系统媒体卡」组件 {@code MiuiMediaNotificationController}，
+     * 忠实复刻 2.0.212（该版本<b>根本不存在</b>此组件，也没有媒体岛）。
      *
-     * <p>背景：3.0.3 的「美化媒体卡」来自 {@code MediaData} → {@code MiuiMediaNotificationController}
-     * （配 {@code MiuiMediaViewController} / {@code MiuiMediaViewHolder} / {@code MiuiMediaAlbumAnimationUtils}）。
-     * 而 v1.3 为拿回状态栏图标放行了 {@code shouldFilterOut}，导致原始裸通知也进了下拉栏——
-     * 那是未美化的，所以「很丑」，且和美化卡重复。
+     * <p>为什么不是「隐藏通知行」：v1.5 尝试跳过 {@code NotificationRowBinderImpl.inflateViews}
+     * 来隐藏原始通知行，实测<b>状态栏图标也随之消失</b>——图标与行渲染是绑定的，无法这样解耦。
+     * 所以改为从源头停掉 3.0.3 新增的那个系统卡组件本身：它拿不到媒体数据就不会渲染，
+     * 于是只剩音乐 App 自己的通知 + 状态栏图标，即 2.0.212 的效果。
      *
-     * <p>状态栏图标由独立的 {@code IconManager} 管理，与通知行渲染解耦，
-     * 因此这里跳过 {@code NotificationRowBinderImpl.inflateViews}（void 方法不 proceed 即阻断），
-     * 让原始丑行不渲染；美化卡与状态栏图标都保留，效果与 2.0.212 一致。
+     * <p>拦截它的两个数据入口（void 方法不 proceed 即阻断）：
+     * <ul>
+     *   <li>{@code MiuiMediaNotificationController$mediaDataListener$1.onMediaDataLoaded}</li>
+     *   <li>{@code MiuiMediaNotificationController$MediaDataChangeListener.onMediaDataChanged}</li>
+     * </ul>
      */
-    private void hookHideRawMediaRow(ClassLoader cl) {
-        try {
-            Class<?> binderCls = Class.forName(
-                    "com.android.systemui.statusbar.notification.collection.inflation.NotificationRowBinderImpl",
-                    false, cl);
-            Class<?> entryCls = Class.forName(
-                    "com.android.systemui.statusbar.notification.collection.NotificationEntry",
-                    false, cl);
-            Class<?> sbnCls = Class.forName(
-                    "android.service.notification.StatusBarNotification", false, cl);
-            Class<?> mdmCls = Class.forName(
-                    "com.android.systemui.media.controls.domain.pipeline.MediaDataManager", false, cl);
-            Method isMedia = mdmCls.getDeclaredMethod("isMediaNotification", sbnCls);
-
-            // 按名字找 inflateViews，避免依赖内部类参数类型的精确签名
-            Method inflateViews = null;
-            for (Method m : binderCls.getDeclaredMethods()) {
-                if ("inflateViews".equals(m.getName())) {
-                    if (m.getParameterTypes().length == 3) {
-                        inflateViews = m;
+    private void hookDisableSystemMediaCard(ClassLoader cl) {
+        String[][] specs = {
+                {"com.android.systemui.statusbar.notification.mediacontrol"
+                        + ".MiuiMediaNotificationController$mediaDataListener$1", "onMediaDataLoaded"},
+                {"com.android.systemui.statusbar.notification.mediacontrol"
+                        + ".MiuiMediaNotificationController$MediaDataChangeListener", "onMediaDataChanged"},
+        };
+        for (String[] spec : specs) {
+            try {
+                Class<?> c = Class.forName(spec[0], false, cl);
+                Method m = null;
+                for (Method mm : c.getDeclaredMethods()) {
+                    if (spec[1].equals(mm.getName())) {
+                        m = mm;
                         break;
                     }
                 }
+                if (m == null) {
+                    log(Log.WARN, TAG, "system card method not found: " + spec[1]);
+                    continue;
+                }
+                hook(m)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept((XposedInterface.Chain chain) -> {
+                            log(Log.INFO, TAG,
+                                    "[syscard] block " + spec[1] + " -> 2.0.212 has no such card");
+                            return null; // void 方法：不 proceed 即阻断
+                        });
+                log(Log.INFO, TAG, "hooked " + spec[0].substring(spec[0].lastIndexOf('.') + 1)
+                        + "." + spec[1] + " (system media card disabled)");
+                log(Log.INFO, TAG, "deoptimize " + spec[1] + " -> " + deoptimize(m));
+            } catch (Throwable t) {
+                log(Log.WARN, TAG, "disable system media card failed: " + spec[1] + " (" + t + ")");
             }
-            if (inflateViews == null) {
-                log(Log.WARN, TAG, "inflateViews not found");
-                return;
-            }
-
-            hook(inflateViews)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .intercept((XposedInterface.Chain chain) -> {
-                        Object entry = chain.getArgs().get(0);
-                        try {
-                            Field f = findField(entryCls, "mSbn");
-                            if (f != null) {
-                                f.setAccessible(true);
-                                Object sbn = f.get(entry);
-                                if (sbn != null
-                                        && Boolean.TRUE.equals(isMedia.invoke(null, sbn))
-                                        && shouldBlock(sbn)) {
-                                    log(Log.INFO, TAG,
-                                            "[row] skip raw media row -> keep beautified card + icon");
-                                    return null; // void 方法：不 proceed 即阻断
-                                }
-                            }
-                        } catch (Throwable t) {
-                            log(Log.WARN, TAG, "[row] check failed: " + t);
-                        }
-                        return chain.proceed();
-                    });
-
-            log(Log.INFO, TAG, "hooked NotificationRowBinderImpl.inflateViews");
-            log(Log.INFO, TAG, "deoptimize inflateViews -> " + deoptimize(inflateViews));
-        } catch (Throwable t) {
-            log(Log.WARN, TAG, "hook inflateViews failed: " + t);
         }
     }
 
