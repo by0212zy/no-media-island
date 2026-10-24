@@ -178,8 +178,8 @@ public class NoMediaIsland extends XposedModule {
             log(Log.ERROR, TAG, "hook failed: " + t);
         }
 
-        // (4) 停用 3.0.3 独有的「系统媒体卡」组件（2.0.212 根本没有它）→ 回落 2.0.212 行为
-        hookDisableSystemMediaCard(cl);
+        // (4) 隐藏 App 裸通知那一行（行仍渲染→状态栏图标保留），改由 SystemUI 媒体卡呈现
+        hookHideRawMediaRow(cl);
     }
 
     /**
@@ -252,40 +252,78 @@ public class NoMediaIsland extends XposedModule {
      *   <li>{@code MiuiMediaNotificationController$MediaDataChangeListener.onMediaDataChanged}</li>
      * </ul>
      */
-    private void hookDisableSystemMediaCard(ClassLoader cl) {
-        String[][] specs = {
-                {"com.android.systemui.statusbar.notification.mediacontrol"
-                        + ".MiuiMediaNotificationController$mediaDataListener$1", "onMediaDataLoaded"},
-                {"com.android.systemui.statusbar.notification.mediacontrol"
-                        + ".MiuiMediaNotificationController$MediaDataChangeListener", "onMediaDataChanged"},
-        };
-        for (String[] spec : specs) {
-            try {
-                Class<?> c = Class.forName(spec[0], false, cl);
-                Method m = null;
-                for (Method mm : c.getDeclaredMethods()) {
-                    if (spec[1].equals(mm.getName())) {
-                        m = mm;
-                        break;
-                    }
-                }
-                if (m == null) {
-                    log(Log.WARN, TAG, "system card method not found: " + spec[1]);
-                    continue;
-                }
-                hook(m)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .intercept((XposedInterface.Chain chain) -> {
-                            log(Log.INFO, TAG,
-                                    "[syscard] block " + spec[1] + " -> 2.0.212 has no such card");
-                            return null; // void 方法：不 proceed 即阻断
-                        });
-                log(Log.INFO, TAG, "hooked " + spec[0].substring(spec[0].lastIndexOf('.') + 1)
-                        + "." + spec[1] + " (system media card disabled)");
-                log(Log.INFO, TAG, "deoptimize " + spec[1] + " -> " + deoptimize(m));
-            } catch (Throwable t) {
-                log(Log.WARN, TAG, "disable system media card failed: " + spec[1] + " (" + t + ")");
+    private void hookHideRawMediaRow(ClassLoader cl) {
+        try {
+            Class<?> rowCls = Class.forName(
+                    "com.android.systemui.statusbar.notification.row.ExpandableNotificationRow",
+                    false, cl);
+            Class<?> sbnCls = Class.forName(
+                    "android.service.notification.StatusBarNotification", false, cl);
+            Class<?> mdmCls = Class.forName(
+                    "com.android.systemui.media.controls.domain.pipeline.MediaDataManager", false, cl);
+            Method isMedia = mdmCls.getDeclaredMethod("isMediaNotification", sbnCls);
+            Method getEntry = rowCls.getMethod("getEntry");
+
+            // 1) 主手段：媒体行高度置 0（持久生效；行仍在管线里，状态栏图标不受影响）
+            Method getH = rowCls.getDeclaredMethod("getIntrinsicHeight");
+            hook(getH)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept((XposedInterface.Chain chain) -> {
+                        if (isMediaRow(chain.getThisObject(), getEntry, isMedia)) {
+                            return 0; // 折叠为 0 高度 → 界面上看不见
+                        }
+                        return chain.proceed();
+                    });
+            log(Log.INFO, TAG, "hooked ExpandableNotificationRow.getIntrinsicHeight (collapse media row)");
+            log(Log.INFO, TAG, "deoptimize getIntrinsicHeight -> " + deoptimize(getH));
+
+            // 2) 附加手段：附加到窗口时直接 GONE（不 hook setVisibility，避免递归）
+            Method onAttach = rowCls.getDeclaredMethod("onAttachedToWindow");
+            hook(onAttach)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept((XposedInterface.Chain chain) -> {
+                        Object row = chain.getThisObject();
+                        Object result = chain.proceed();
+                        try {
+                            if (isMediaRow(row, getEntry, isMedia)) {
+                                android.view.View.class
+                                        .getMethod("setVisibility", int.class)
+                                        .invoke(row, android.view.View.GONE);
+                                log(Log.INFO, TAG, "[row] hide raw media row (GONE)");
+                            }
+                        } catch (Throwable t) {
+                            log(Log.WARN, TAG, "[rowvisibility] " + t);
+                        }
+                        return result;
+                    });
+            log(Log.INFO, TAG, "hooked ExpandableNotificationRow.onAttachedToWindow");
+            log(Log.INFO, TAG, "deoptimize onAttachedToWindow -> " + deoptimize(onAttach));
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "hook hide raw media row failed: " + t);
+        }
+    }
+
+    /** 判断该通知行是否属于需要隐藏的媒体通知。 */
+    private static boolean isMediaRow(Object row, Method getEntry, Method isMedia) {
+        if (row == null) {
+            return false;
+        }
+        try {
+            Object entry = getEntry.invoke(row);
+            if (entry == null) {
+                return false;
             }
+            Field f = findField(entry.getClass(), "mSbn");
+            if (f == null) {
+                return false;
+            }
+            f.setAccessible(true);
+            Object sbn = f.get(entry);
+            return sbn != null
+                    && Boolean.TRUE.equals(isMedia.invoke(null, sbn))
+                    && shouldBlock(sbn);
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
