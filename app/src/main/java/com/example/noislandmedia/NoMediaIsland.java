@@ -1,8 +1,16 @@
 package com.example.noislandmedia;
 
+import android.content.Context;
+import android.graphics.drawable.GradientDrawable;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
+import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
@@ -559,6 +567,17 @@ public class NoMediaIsland extends XposedModule {
     /** 本次手势是否已切换过（避免一次滑动连续切多张）。 */
     private static volatile boolean gestureSwitched;
 
+    // ===== 手势覆盖范围 + 页面指示器 =====
+    /** 媒体卡片的外层控制器（MiuiMediaNotificationController），用于取 mediaContainerView。 */
+    private static volatile Object layoutController = null;
+    /** 外层容器是否已登记为手势区域。 */
+    private static volatile boolean containerRegistered = false;
+    /** 指示器宿主（mediaContainerView）。 */
+    private static volatile ViewGroup indicatorHost = null;
+    /** 指示器视图本体。 */
+    private static volatile LinearLayout indicatorView = null;
+    private static volatile Handler mainHandler = null;
+
     /**
      * 在 HyperOS 3 的 MIUI 媒体卡上实现<b>横滑切换媒体会话</b>（MIUI 同款多会话管理）。
      *
@@ -614,6 +633,8 @@ public class NoMediaIsland extends XposedModule {
                                 if (vc != null) {
                                     VIEW_CONTROLLER_BIND.put(vc, bindMediaData);
                                 }
+                                layoutController = chain.getThisObject();
+                                containerRegistered = false;
                             } catch (Throwable t) {
                                 log(Log.WARN, TAG, "[switcher] ctor capture: " + t);
                             }
@@ -671,6 +692,114 @@ public class NoMediaIsland extends XposedModule {
         }
     }
 
+    /**
+     * 惰性把媒体卡片的外层容器（{@code mediaContainerView}）登记为手势区域。
+     * 该字段在 {@code loadLayout()} 里才创建，所以不能在构造函数里读，只能在运行时惰性解析。
+     */
+    private static void ensureContainerRegistered() {
+        if (containerRegistered || layoutController == null) {
+            return;
+        }
+        try {
+            Field f = findField(layoutController.getClass(), "mediaContainerView");
+            if (f == null) {
+                return;
+            }
+            f.setAccessible(true);
+            Object v = f.get(layoutController);
+            if (v instanceof View) {
+                CARD_VIEWS.put((View) v, Boolean.TRUE);
+                if (v instanceof ViewGroup) {
+                    indicatorHost = (ViewGroup) v;
+                }
+                containerRegistered = true;
+                Log.i(TAG, "[switcher] media container registered as swipe area");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "[switcher] container resolve: " + t);
+        }
+    }
+
+    /** 在媒体卡片下方刷新页面指示器（小圆点，当前会话高亮）。 */
+    private static void updateIndicator() {
+        if (mainHandler == null) {
+            try {
+                mainHandler = new Handler(Looper.getMainLooper());
+            } catch (Throwable t) {
+                return;
+            }
+        }
+        mainHandler.post(() -> {
+            try {
+                ensureContainerRegistered();
+                ViewGroup host = indicatorHost;
+                if (host == null) {
+                    return;
+                }
+                int count;
+                synchronized (SESSIONS) {
+                    count = SESSIONS.size();
+                }
+                LinearLayout ind = indicatorView;
+
+                if (count < 2) {
+                    if (ind != null && ind.getParent() != null) {
+                        ((ViewGroup) ind.getParent()).removeView(ind);
+                    }
+                    indicatorView = null;
+                    return;
+                }
+
+                if (ind == null || ind.getParent() != host) {
+                    if (ind != null && ind.getParent() != null) {
+                        ((ViewGroup) ind.getParent()).removeView(ind);
+                    }
+                    ind = new LinearLayout(host.getContext());
+                    ind.setOrientation(LinearLayout.HORIZONTAL);
+                    ind.setGravity(Gravity.CENTER);
+                    FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT);
+                    lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+                    lp.bottomMargin = (int) (6 * host.getResources().getDisplayMetrics().density);
+                    ind.setLayoutParams(lp);
+                    host.addView(ind);
+                    indicatorView = ind;
+                }
+
+                ind.removeAllViews();
+                List<String> keys;
+                synchronized (SESSIONS) {
+                    keys = new ArrayList<>(SESSIONS.keySet());
+                }
+                int activeIdx = currentSessionKey == null ? 0 : keys.indexOf(currentSessionKey);
+                if (activeIdx < 0) {
+                    activeIdx = 0;
+                }
+                for (int i = 0; i < keys.size(); i++) {
+                    ind.addView(makeDot(host.getContext(), i == activeIdx));
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "[indicator] update: " + t);
+            }
+        });
+    }
+
+    /** 生成一个小圆点。 */
+    private static View makeDot(Context c, boolean active) {
+        View v = new View(c);
+        int size = (int) (6 * c.getResources().getDisplayMetrics().density);
+        GradientDrawable d = new GradientDrawable();
+        d.setShape(GradientDrawable.OVAL);
+        d.setColor(active ? 0xFFFFFFFF : 0x55FFFFFF);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(size, size);
+        lp.leftMargin = size / 2;
+        lp.rightMargin = size / 2;
+        v.setLayoutParams(lp);
+        v.setBackground(d);
+        return v;
+    }
+
     /** 注册 MediaDataManager.Listener（动态代理）收集所有媒体会话。 */
     private void registerSessionListener(Object mediaDataManager, ClassLoader cl) {
         try {
@@ -697,6 +826,7 @@ public class NoMediaIsland extends XposedModule {
                         SESSIONS.put(key, data);
                         log(Log.INFO, TAG, "[switcher] session: " + key
                                 + " (total=" + SESSIONS.size() + ")");
+                        updateIndicator();
                     }
                     return null;
                 }
@@ -705,6 +835,7 @@ public class NoMediaIsland extends XposedModule {
                     if (key != null) {
                         SESSIONS.remove(key);
                         log(Log.INFO, TAG, "[switcher] removed: " + key);
+                        updateIndicator();
                     }
                     return null;
                 }
@@ -741,6 +872,7 @@ public class NoMediaIsland extends XposedModule {
                 bindMethod.invoke(viewController, data);
                 currentSessionKey = nextKey;
                 log(Log.INFO, TAG, "[switcher] switched -> " + nextKey);
+                updateIndicator();
             } catch (Throwable t) {
                 log(Log.WARN, TAG, "[switcher] bind failed: " + t);
             }
@@ -780,6 +912,10 @@ public class NoMediaIsland extends XposedModule {
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept((XposedInterface.Chain chain) -> {
                         View self = (View) chain.getThisObject();
+                        // 把媒体卡片外层容器也纳入手势区域：
+                        // player 只覆盖卡片内部一部分，外圈/空白处属于容器，
+                        // 不登记的话那里滑动会被通知的侧滑接管（表现为"只有标题位置能滑"）。
+                        ensureContainerRegistered();
                         if (self == null || CARD_VIEWS.isEmpty() || !CARD_VIEWS.containsKey(self)) {
                             return chain.proceed();
                         }
