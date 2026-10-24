@@ -541,6 +541,17 @@ public class NoMediaIsland extends XposedModule {
     /** 当前卡片正在控制的会话 key。 */
     private static volatile String currentSessionKey = null;
 
+    /** 媒体卡 View（holder.player），用于身份判断限定手势范围。 */
+    private static volatile View mediaCardView = null;
+    /** 卡片对应的视图控制器与其 bindMediaData。 */
+    private static volatile Object cardViewController = null;
+    private static volatile Method cardBindMethod = null;
+    /** 手势状态（只针对 mediaCardView）。 */
+    private static volatile float gestureDownX;
+    private static volatile float gestureDownY;
+    private static volatile boolean gestureDecided;
+    private static volatile boolean gestureHorizontal;
+
     /**
      * 在 HyperOS 3 的 MIUI 媒体卡上实现<b>横滑切换媒体会话</b>（MIUI 同款多会话管理）。
      *
@@ -603,7 +614,7 @@ public class NoMediaIsland extends XposedModule {
                         });
             }
 
-            // 2) attach：给卡片 View 挂横滑手势
+            // 2) attach：记录媒体卡 View / 视图控制器（手势在 dispatchTouchEvent 里统一处理）
             hook(attach)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept((XposedInterface.Chain chain) -> {
@@ -613,16 +624,21 @@ public class NoMediaIsland extends XposedModule {
                             Object holder = chain.getArgs().get(0);
                             Object player = playerField.get(holder);
                             if (vc != null && player instanceof View) {
-                                ((View) player).setOnTouchListener(
-                                        new MediaCardTouchListener(
-                                                NoMediaIsland.this, vc, bindMediaData));
-                                log(Log.INFO, TAG, "[switcher] swipe attached to media card");
+                                mediaCardView = (View) player;
+                                cardViewController = vc;
+                                cardBindMethod = bindMediaData;
+                                log(Log.INFO, TAG, "[switcher] media card registered");
                             }
                         } catch (Throwable t) {
-                            log(Log.WARN, TAG, "[switcher] attach touch failed: " + t);
+                            log(Log.WARN, TAG, "[switcher] attach capture failed: " + t);
                         }
                         return result;
                     });
+
+            // 2b) 手势拦截：挂在 View.dispatchTouchEvent，按身份限定只处理这张媒体卡。
+            //     这样卡片内任意子 View（封面/进度条/按钮）上的滑动都能捕获，
+            //     不会出现 DOWN 被子 View 吃掉而收不到 MOVE 的情况。
+            hookViewDispatchTouch();
 
             // 3) bindMediaData：记录当前正在控制的会话
             hook(bindMediaData)
@@ -745,7 +761,86 @@ public class NoMediaIsland extends XposedModule {
         return null;
     }
 
-    /** 媒体卡横滑手势：左右滑动切换媒体会话。 */
+    /**
+     * 挂 {@code View.dispatchTouchEvent} 并用身份判断只处理媒体卡。
+     * 非媒体卡的事件直接放行（开销仅一次引用比较）。
+     */
+    private void hookViewDispatchTouch() {
+        try {
+            Method dte = View.class.getDeclaredMethod("dispatchTouchEvent", MotionEvent.class);
+            hook(dte)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept((XposedInterface.Chain chain) -> {
+                        View self = (View) chain.getThisObject();
+                        View card = mediaCardView;
+                        if (self == null || card == null || self != card) {
+                            return chain.proceed();
+                        }
+                        MotionEvent ev = (MotionEvent) chain.getArgs().get(0);
+                        try {
+                            switch (ev.getActionMasked()) {
+                                case MotionEvent.ACTION_DOWN:
+                                    gestureDownX = ev.getRawX();
+                                    gestureDownY = ev.getRawY();
+                                    gestureDecided = false;
+                                    gestureHorizontal = false;
+                                    break;
+
+                                case MotionEvent.ACTION_MOVE: {
+                                    float dx = ev.getRawX() - gestureDownX;
+                                    float dy = ev.getRawY() - gestureDownY;
+                                    float slop = 8f * self.getResources().getDisplayMetrics().density;
+                                    if (!gestureDecided) {
+                                        if (Math.max(Math.abs(dx), Math.abs(dy)) < slop) break;
+                                        gestureDecided = true;
+                                        gestureHorizontal = Math.abs(dx) > Math.abs(dy) * 1.2f;
+                                    }
+                                    if (gestureHorizontal) {
+                                        // 阻止通知行的侧滑清除/父容器抢走这次手势
+                                        if (self.getParent() != null) {
+                                            self.getParent().requestDisallowInterceptTouchEvent(true);
+                                        }
+                                        return Boolean.TRUE; // 消费掉，继续收后续事件
+                                    }
+                                    break;
+                                }
+
+                                case MotionEvent.ACTION_UP: {
+                                    if (gestureHorizontal) {
+                                        float dx = ev.getRawX() - gestureDownX;
+                                        float threshold = Math.max(
+                                                self.getWidth() * 0.12f,
+                                                40f * self.getResources().getDisplayMetrics().density);
+                                        if (Math.abs(dx) > threshold) {
+                                            switchSession(dx < 0 ? 1 : -1,
+                                                    cardViewController, cardBindMethod);
+                                        }
+                                    }
+                                    gestureDecided = false;
+                                    gestureHorizontal = false;
+                                    break;
+                                }
+
+                                case MotionEvent.ACTION_CANCEL:
+                                    gestureDecided = false;
+                                    gestureHorizontal = false;
+                                    break;
+
+                                default:
+                                    break;
+                            }
+                        } catch (Throwable t) {
+                            log(Log.WARN, TAG, "[switcher] gesture error: " + t);
+                        }
+                        return chain.proceed();
+                    });
+            log(Log.INFO, TAG, "hooked View.dispatchTouchEvent (media card swipe)");
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "hook dispatchTouchEvent failed: " + t);
+        }
+    }
+
+    /** 媒体卡横滑手势：左右滑动切换媒体会话。（保留备用实现） */
     private static final class MediaCardTouchListener implements View.OnTouchListener {
         private final NoMediaIsland module;
         private final Object viewController;
