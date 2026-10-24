@@ -4,6 +4,8 @@ import android.content.Context;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Handler;
 import android.os.Looper;
+import android.content.res.ColorStateList;
+import android.util.AttributeSet;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -569,15 +571,19 @@ public class NoMediaIsland extends XposedModule {
     /** 本次触摸是否落在媒体卡内（DOWN 时命中测试决定，MOVE/UP 沿用）。 */
     private static volatile boolean gestureOnCard;
 
-    // ===== 手势覆盖范围 + 页面指示器 =====
+    // ===== 手势覆盖范围 + 页面指示器（原生 PageIndicator） =====
     /** 媒体卡片的外层控制器（MiuiMediaNotificationController），用于取 mediaContainerView。 */
     private static volatile Object layoutController = null;
     /** 外层容器是否已登记为手势区域。 */
     private static volatile boolean containerRegistered = false;
-    /** 指示器宿主（mediaContainerView）。 */
-    private static volatile ViewGroup indicatorHost = null;
-    /** 指示器视图本体。 */
-    private static volatile LinearLayout indicatorView = null;
+    /** 原生 PageIndicator 实例（com.android.systemui.qs.PageIndicator）。 */
+    private static volatile View pageIndicatorView = null;
+    /** PageIndicator 的 setNumPages / setLocation / setTintList 方法。 */
+    private static volatile Method piSetNumPages = null;
+    private static volatile Method piSetLocation = null;
+    private static volatile Method piSetTintList = null;
+    /** 已设置的页数（避免重复 setNumPages）。 */
+    private static volatile int piPageCount = -1;
     private static volatile Handler mainHandler = null;
 
     /**
@@ -661,13 +667,14 @@ public class NoMediaIsland extends XposedModule {
                                 View parent = ((View) player).getParent() instanceof View
                                         ? (View) ((View) player).getParent() : null;
                                 if (parent instanceof ViewGroup) {
-                                    indicatorHost = (ViewGroup) parent;
                                     // 把整卡容器也纳入命中测试，使卡片任意位置（含下方空白）都能滑
                                     CARD_VIEWS.put(parent, Boolean.TRUE);
                                 }
+                                // 延迟挂指示器：此刻 player 可能还没真正加入布局，
+                                // 需在 player.post 里再取 parent（参考 HyperLyric）。
+                                attachIndicator((View) player);
                                 log(Log.INFO, TAG, "[switcher] media card registered (total="
                                         + CARD_VIEWS.size() + ")");
-                                updateIndicator();
                             }
                         } catch (Throwable t) {
                             log(Log.WARN, TAG, "[switcher] attach capture failed: " + t);
@@ -720,9 +727,6 @@ public class NoMediaIsland extends XposedModule {
             Object v = f.get(layoutController);
             if (v instanceof View) {
                 CARD_VIEWS.put((View) v, Boolean.TRUE);
-                if (indicatorHost == null && v instanceof ViewGroup) {
-                    indicatorHost = (ViewGroup) v;
-                }
                 containerRegistered = true;
                 Log.i(TAG, "[switcher] media container registered as swipe area");
             }
@@ -731,7 +735,88 @@ public class NoMediaIsland extends XposedModule {
         }
     }
 
-    /** 在媒体卡片下方刷新页面指示器（小圆点，当前会话高亮）。 */
+    /**
+     * 延迟把原生 PageIndicator 挂到媒体卡底部。
+     * 参考 HyperLyric：player 此刻可能尚未真正加入布局，需在 post 后取 parent；
+     * 且 PageIndicator 必须挂在 FrameLayout 父容器上（否则 addView 不生效）。
+     */
+    private static void attachIndicator(View player) {
+        try {
+            if (player.getParent() instanceof ViewGroup) {
+                attachIndicatorTo((ViewGroup) player.getParent(),
+                        player.getContext(), player.getClass().getClassLoader());
+            } else {
+                player.post(() -> attachIndicator(player));
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "[indicator] attach: " + t);
+        }
+    }
+
+    private static void attachIndicatorTo(ViewGroup parent, Context ctx, ClassLoader cl) {
+        try {
+            // 向上找到承载指示器的 FrameLayout（系统媒体卡用 PageIndicator 底部居中）
+            ViewGroup frame = parent;
+            while (frame != null && !(frame instanceof FrameLayout)) {
+                View p = frame.getParent() instanceof View ? (View) frame.getParent() : null;
+                if (!(p instanceof ViewGroup)) {
+                    break;
+                }
+                frame = (ViewGroup) p;
+            }
+            if (!(frame instanceof FrameLayout)) {
+                Log.w(TAG, "[indicator] no FrameLayout parent for PageIndicator");
+                return;
+            }
+            if (pageIndicatorView != null && pageIndicatorView.getParent() == frame) {
+                return;
+            }
+            if (pageIndicatorView == null) {
+                pageIndicatorView = createPageIndicator(ctx, cl);
+                if (pageIndicatorView == null) {
+                    return;
+                }
+            }
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+            lp.bottomMargin = (int) (4 * frame.getResources().getDisplayMetrics().density);
+            pageIndicatorView.setClickable(false);
+            pageIndicatorView.setFocusable(false);
+            pageIndicatorView.setFocusableInTouchMode(false);
+            frame.addView(pageIndicatorView, lp);
+            piPageCount = -1;
+            Log.i(TAG, "[indicator] PageIndicator attached to " + frame.getClass().getSimpleName());
+            updateIndicator();
+        } catch (Throwable t) {
+            Log.w(TAG, "[indicator] attachTo: " + t);
+        }
+    }
+
+    /** 创建 SystemUI 原生 PageIndicator（com.android.systemui.qs.PageIndicator）。 */
+    private static View createPageIndicator(Context ctx, ClassLoader cl) {
+        try {
+            Class<?> pic = Class.forName("com.android.systemui.qs.PageIndicator", false, cl);
+            if (!View.class.isAssignableFrom(pic)) {
+                return null;
+            }
+            Constructor<?> ctor = pic.getConstructor(Context.class, AttributeSet.class);
+            View v = (View) ctor.newInstance(ctx, null);
+            piSetNumPages = pic.getMethod("setNumPages", int.class);
+            piSetLocation = pic.getMethod("setLocation", float.class);
+            try {
+                piSetTintList = pic.getMethod("setTintList", ColorStateList.class);
+            } catch (Throwable ignored) {
+            }
+            Log.i(TAG, "[indicator] native PageIndicator created");
+            return v;
+        } catch (Throwable t) {
+            Log.w(TAG, "[indicator] create PageIndicator failed (fallback: none): " + t);
+            return null;
+        }
+    }
+
+    /** 更新页面指示器：页数 <2 隐藏，否则显示并高亮当前会话。 */
     private static void updateIndicator() {
         if (mainHandler == null) {
             try {
@@ -742,43 +827,19 @@ public class NoMediaIsland extends XposedModule {
         }
         mainHandler.post(() -> {
             try {
-                ensureContainerRegistered();
-                ViewGroup host = indicatorHost;
-                if (host == null) {
+                View pi = pageIndicatorView;
+                if (pi == null) {
                     return;
                 }
                 int count;
                 synchronized (SESSIONS) {
                     count = SESSIONS.size();
                 }
-                LinearLayout ind = indicatorView;
-
                 if (count < 2) {
-                    if (ind != null && ind.getParent() != null) {
-                        ((ViewGroup) ind.getParent()).removeView(ind);
-                    }
-                    indicatorView = null;
+                    pi.setVisibility(View.GONE);
+                    piPageCount = -1;
                     return;
                 }
-
-                if (ind == null || ind.getParent() != host) {
-                    if (ind != null && ind.getParent() != null) {
-                        ((ViewGroup) ind.getParent()).removeView(ind);
-                    }
-                    ind = new LinearLayout(host.getContext());
-                    ind.setOrientation(LinearLayout.HORIZONTAL);
-                    ind.setGravity(Gravity.CENTER);
-                    FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                            ViewGroup.LayoutParams.WRAP_CONTENT);
-                    lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
-                    lp.bottomMargin = (int) (6 * host.getResources().getDisplayMetrics().density);
-                    ind.setLayoutParams(lp);
-                    host.addView(ind);
-                    indicatorView = ind;
-                }
-
-                ind.removeAllViews();
                 List<String> keys;
                 synchronized (SESSIONS) {
                     keys = new ArrayList<>(SESSIONS.keySet());
@@ -787,28 +848,19 @@ public class NoMediaIsland extends XposedModule {
                 if (activeIdx < 0) {
                     activeIdx = 0;
                 }
-                for (int i = 0; i < keys.size(); i++) {
-                    ind.addView(makeDot(host.getContext(), i == activeIdx));
+                if (piPageCount != count && piSetNumPages != null) {
+                    piSetNumPages.invoke(pi, count);
+                    piPageCount = count;
                 }
+                pi.setVisibility(View.VISIBLE);
+                if (piSetLocation != null) {
+                    piSetLocation.invoke(pi, (float) activeIdx);
+                }
+                Log.i(TAG, "[indicator] updated pages=" + count + " active=" + activeIdx);
             } catch (Throwable t) {
                 Log.w(TAG, "[indicator] update: " + t);
             }
         });
-    }
-
-    /** 生成一个小圆点。 */
-    private static View makeDot(Context c, boolean active) {
-        View v = new View(c);
-        int size = (int) (6 * c.getResources().getDisplayMetrics().density);
-        GradientDrawable d = new GradientDrawable();
-        d.setShape(GradientDrawable.OVAL);
-        d.setColor(active ? 0xFFFFFFFF : 0x55FFFFFF);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(size, size);
-        lp.leftMargin = size / 2;
-        lp.rightMargin = size / 2;
-        v.setLayoutParams(lp);
-        v.setBackground(d);
-        return v;
     }
 
     /** 注册 MediaDataManager.Listener（动态代理）收集所有媒体会话。 */
@@ -932,6 +984,19 @@ public class NoMediaIsland extends XposedModule {
         return false;
     }
 
+    /** 进度条（SeekBar 及其子类）上的触摸应放行给原生拖动，不触发切卡手势。 */
+    private static boolean isOnSeekBar(View v) {
+        Class<?> c = v.getClass();
+        while (c != null) {
+            String n = c.getName();
+            if (n.endsWith("SeekBar")) {
+                return true;
+            }
+            c = c.getSuperclass();
+        }
+        return false;
+    }
+
     /**
      * 挂 {@code View.dispatchTouchEvent} 用命中测试处理整张媒体卡的手势。
      * 卡片内任意子 View 上的触摸都会作为 self 经过本钩子；命中卡内后，
@@ -951,6 +1016,11 @@ public class NoMediaIsland extends XposedModule {
                         int action = ev.getActionMasked();
                         try {
                             if (action == MotionEvent.ACTION_DOWN) {
+                                // 进度条区域不触发切换手势，保留原生拖动调进度
+                                if (isOnSeekBar(self)) {
+                                    gestureOnCard = false;
+                                    return chain.proceed();
+                                }
                                 // 命中测试：从被触摸的 view 向上爬祖先，
                                 // 落到任一登记的媒体卡（player 或整卡容器）子树内即视为卡内。
                                 // 这样封面/标题/边距/下方空白上的触摸都能触发手势，
