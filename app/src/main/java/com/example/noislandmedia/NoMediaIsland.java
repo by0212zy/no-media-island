@@ -1,13 +1,23 @@
 package com.example.noislandmedia;
 
 import android.util.Log;
+import android.view.MotionEvent;
+import android.view.View;
 
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -178,20 +188,14 @@ public class NoMediaIsland extends XposedModule {
             log(Log.ERROR, TAG, "hook failed: " + t);
         }
 
-        // (4) 停用 3.0.3 的 MIUI 卡（miui_media_session.xml），改走 2.0.212 的标准卡
-        hookDisableMiuiMediaCard(cl);
-
-        // (5) 从数据入口断掉「媒体上岛」，让系统回落到标准轮播（MediaCarouselController）
+        // (4) 从数据入口断掉「媒体上岛」（双保险，确保岛不出现）
         hookBlockIslandDataIntake(cl);
 
-        // (6) 隐藏 App 裸通知那一行（行仍渲染→状态栏图标保留）
+        // (5) 隐藏 App 裸通知那一行（行仍渲染→状态栏图标保留）
         hookHideRawMediaRow(cl);
 
-        // (7) 强制标准轮播的宿主可见（探针：MediaHostStateHolder / MediaHost 的 getVisible）
-        hookForceCarouselVisible(cl);
-
-        // (8) UI 结构改动：捕获 MediaHost.hostView，并挂进 MediaHierarchyManager.rootView
-        hookCaptureAndAttachHostView(cl);
+        // (6) 多媒体卡片横滑切换：在 MIUI 媒体卡上左右滑动切换不同音乐 App 的会话
+        hookMediaCardSwitcher(cl);
     }
 
     /**
@@ -523,6 +527,293 @@ public class NoMediaIsland extends XposedModule {
             log(Log.INFO, TAG, "deoptimize updateHostAttachment -> " + deoptimize(uha));
         } catch (Throwable t) {
             log(Log.WARN, TAG, "hook updateHostAttachment failed: " + t);
+        }
+    }
+
+    // ===== 多媒体卡片横滑切换（MIUI 同款：管理多个媒体会话）=====
+
+    /** 当前所有活跃媒体会话：notificationKey -> MediaData（保持插入顺序）。 */
+    private static final Map<String, Object> SESSIONS =
+            Collections.synchronizedMap(new LinkedHashMap<String, Object>());
+    /** 媒体卡视图控制器 -> 其 bindMediaData 方法。 */
+    private static final Map<Object, Method> VIEW_CONTROLLER_BIND =
+            Collections.synchronizedMap(new java.util.WeakHashMap<Object, Method>());
+    /** 当前卡片正在控制的会话 key。 */
+    private static volatile String currentSessionKey = null;
+
+    /**
+     * 在 HyperOS 3 的 MIUI 媒体卡上实现<b>横滑切换媒体会话</b>（MIUI 同款多会话管理）。
+     *
+     * <p>解决问题：{@code MiuiMediaNotificationController} 只呈现 {@code topMediaData}（一个会话），
+     * 同时播两个音乐 App 时另一个无法控制。这里：
+     * <ol>
+     *   <li>hook 控制器构造函数，从参数里抓出 {@code MediaDataManager}（该字段在本机不存在，
+     *       但构造函数第二个参数就是它）。</li>
+     *   <li>注册 {@code MediaDataManager.Listener}（动态代理）收集所有会话 MediaData。</li>
+     *   <li>hook {@code MiuiMediaViewController.attach(holder)}，拿到卡片 View（holder.player），
+     *       挂上横滑手势。</li>
+     *   <li>横滑时调用 {@code bindMediaData(另一个会话的 MediaData)} 完成切换。</li>
+     * </ol>
+     */
+    private void hookMediaCardSwitcher(ClassLoader cl) {
+        try {
+            Class<?> ctrlCls = Class.forName(
+                    "com.android.systemui.statusbar.notification.mediacontrol.MiuiMediaNotificationController",
+                    false, cl);
+            Class<?> vcCls = Class.forName(
+                    "com.android.systemui.statusbar.notification.mediacontrol.MiuiMediaViewController",
+                    false, cl);
+            Class<?> holderCls = Class.forName(
+                    "com.android.systemui.statusbar.notification.mediacontrol.MiuiMediaViewHolder",
+                    false, cl);
+            Class<?> mdmCls = Class.forName(
+                    "com.android.systemui.media.controls.domain.pipeline.MediaDataManager", false, cl);
+            Class<?> mediaDataCls = Class.forName(
+                    "com.android.systemui.media.controls.shared.model.MediaData", false, cl);
+
+            final Method bindMediaData = vcCls.getDeclaredMethod("bindMediaData", mediaDataCls);
+            final Method attach = vcCls.getDeclaredMethod("attach", holderCls);
+            final Field playerField = holderCls.getDeclaredField("player");
+            playerField.setAccessible(true);
+
+            // 1) 构造函数：抓 MediaDataManager 与 ViewController
+            for (Constructor<?> ctor : ctrlCls.getDeclaredConstructors()) {
+                hook(ctor)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept((XposedInterface.Chain chain) -> {
+                            Object result = chain.proceed();
+                            try {
+                                Object mdm = null;
+                                Object vc = null;
+                                for (Object a : chain.getArgs()) {
+                                    if (a == null) continue;
+                                    if (mdm == null && mdmCls.isInstance(a)) mdm = a;
+                                    if (vc == null && vcCls.isInstance(a)) vc = a;
+                                }
+                                if (mdm != null) {
+                                    registerSessionListener(mdm, cl);
+                                }
+                                if (vc != null) {
+                                    VIEW_CONTROLLER_BIND.put(vc, bindMediaData);
+                                }
+                            } catch (Throwable t) {
+                                log(Log.WARN, TAG, "[switcher] ctor capture: " + t);
+                            }
+                            return result;
+                        });
+            }
+
+            // 2) attach：给卡片 View 挂横滑手势
+            hook(attach)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept((XposedInterface.Chain chain) -> {
+                        Object result = chain.proceed();
+                        try {
+                            Object vc = chain.getThisObject();
+                            Object holder = chain.getArgs().get(0);
+                            Object player = playerField.get(holder);
+                            if (vc != null && player instanceof View) {
+                                ((View) player).setOnTouchListener(
+                                        new MediaCardTouchListener(
+                                                NoMediaIsland.this, vc, bindMediaData));
+                                log(Log.INFO, TAG, "[switcher] swipe attached to media card");
+                            }
+                        } catch (Throwable t) {
+                            log(Log.WARN, TAG, "[switcher] attach touch failed: " + t);
+                        }
+                        return result;
+                    });
+
+            // 3) bindMediaData：记录当前正在控制的会话
+            hook(bindMediaData)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept((XposedInterface.Chain chain) -> {
+                        Object result = chain.proceed();
+                        try {
+                            String key = readStringField(chain.getArgs().get(0), "notificationKey");
+                            if (key != null) {
+                                currentSessionKey = key;
+                                log(Log.INFO, TAG, "[switcher] now controlling: " + key);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        return result;
+                    });
+
+            log(Log.INFO, TAG, "hooked media card switcher");
+            log(Log.INFO, TAG, "deoptimize attach -> " + deoptimize(attach));
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "hook media card switcher failed: " + t);
+        }
+    }
+
+    /** 注册 MediaDataManager.Listener（动态代理）收集所有媒体会话。 */
+    private void registerSessionListener(Object mediaDataManager, ClassLoader cl) {
+        try {
+            Class<?> listenerCls = Class.forName(
+                    "com.android.systemui.media.controls.domain.pipeline.MediaDataManager$Listener",
+                    false, cl);
+            Method addListener = null;
+            for (Method m : mediaDataManager.getClass().getMethods()) {
+                if ("addListener".equals(m.getName()) && m.getParameterCount() == 1) {
+                    addListener = m;
+                    break;
+                }
+            }
+            if (addListener == null) {
+                log(Log.WARN, TAG, "[switcher] addListener not found");
+                return;
+            }
+            InvocationHandler handler = (proxy, method, args) -> {
+                String name = method.getName();
+                if ("onMediaDataLoaded".equals(name)) {
+                    String key = args != null && args.length > 0 ? (String) args[0] : null;
+                    Object data = args != null && args.length > 2 ? args[2] : null;
+                    if (key != null && data != null) {
+                        SESSIONS.put(key, data);
+                        log(Log.INFO, TAG, "[switcher] session: " + key
+                                + " (total=" + SESSIONS.size() + ")");
+                    }
+                    return null;
+                }
+                if ("onMediaDataRemoved".equals(name)) {
+                    String key = args != null && args.length > 0 ? (String) args[0] : null;
+                    if (key != null) {
+                        SESSIONS.remove(key);
+                        log(Log.INFO, TAG, "[switcher] removed: " + key);
+                    }
+                    return null;
+                }
+                if ("toString".equals(name)) return "NoMediaIsland.Switcher";
+                if ("hashCode".equals(name)) return System.identityHashCode(proxy);
+                if ("equals".equals(name)) return proxy == (args != null ? args[0] : null);
+                Class<?> rt = method.getReturnType();
+                if (rt == boolean.class) return Boolean.FALSE;
+                if (rt.isPrimitive()) return 0;
+                return null;
+            };
+            Object proxy = Proxy.newProxyInstance(cl, new Class<?>[]{listenerCls}, handler);
+            addListener.invoke(mediaDataManager, proxy);
+            log(Log.INFO, TAG, "[switcher] MediaDataManager listener registered");
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "[switcher] register listener failed: " + t);
+        }
+    }
+
+    /** 切换到上/下一个媒体会话（step = +1 下一个，-1 上一个）。 */
+    private void switchSession(int step, Object viewController, Method bindMethod) {
+        synchronized (SESSIONS) {
+            if (SESSIONS.size() < 2) {
+                log(Log.INFO, TAG, "[switcher] only one session, nothing to switch");
+                return;
+            }
+            List<String> keys = new ArrayList<>(SESSIONS.keySet());
+            int idx = currentSessionKey == null ? -1 : keys.indexOf(currentSessionKey);
+            if (idx < 0) idx = 0;
+            int next = (idx + step + keys.size()) % keys.size();
+            String nextKey = keys.get(next);
+            Object data = SESSIONS.get(nextKey);
+            try {
+                bindMethod.invoke(viewController, data);
+                currentSessionKey = nextKey;
+                log(Log.INFO, TAG, "[switcher] switched -> " + nextKey);
+            } catch (Throwable t) {
+                log(Log.WARN, TAG, "[switcher] bind failed: " + t);
+            }
+        }
+    }
+
+    /** 读取对象的 String 字段（先 getter 再字段，含父类）。 */
+    private static String readStringField(Object target, String name) {
+        if (target == null) return null;
+        try {
+            Method m = target.getClass().getMethod("get" + Character.toUpperCase(name.charAt(0))
+                    + name.substring(1));
+            Object r = m.invoke(target);
+            if (r instanceof String) return (String) r;
+        } catch (Throwable ignored) {
+        }
+        try {
+            Field f = findField(target.getClass(), name);
+            if (f != null) {
+                f.setAccessible(true);
+                Object r = f.get(target);
+                if (r instanceof String) return (String) r;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /** 媒体卡横滑手势：左右滑动切换媒体会话。 */
+    private static final class MediaCardTouchListener implements View.OnTouchListener {
+        private final NoMediaIsland module;
+        private final Object viewController;
+        private final Method bindMethod;
+        private float downX;
+        private float downY;
+        private boolean decided;
+        private boolean horizontal;
+
+        MediaCardTouchListener(NoMediaIsland module, Object viewController, Method bindMethod) {
+            this.module = module;
+            this.viewController = viewController;
+            this.bindMethod = bindMethod;
+        }
+
+        @Override
+        public boolean onTouch(View v, MotionEvent event) {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    downX = event.getRawX();
+                    downY = event.getRawY();
+                    decided = false;
+                    horizontal = false;
+                    break;
+
+                case MotionEvent.ACTION_MOVE: {
+                    float dx = event.getRawX() - downX;
+                    float dy = event.getRawY() - downY;
+                    float slop = 12f * v.getResources().getDisplayMetrics().density;
+                    if (!decided) {
+                        if (Math.max(Math.abs(dx), Math.abs(dy)) < slop) break;
+                        decided = true;
+                        horizontal = Math.abs(dx) > Math.abs(dy) * 1.2f;
+                    }
+                    if (horizontal) {
+                        // 阻止通知行的侧滑清除抢走这次手势
+                        if (v.getParent() != null) {
+                            v.getParent().requestDisallowInterceptTouchEvent(true);
+                        }
+                        return true;
+                    }
+                    break;
+                }
+
+                case MotionEvent.ACTION_UP: {
+                    if (horizontal) {
+                        float dx = event.getRawX() - downX;
+                        float threshold = Math.max(
+                                v.getWidth() * 0.15f,
+                                48f * v.getResources().getDisplayMetrics().density);
+                        if (Math.abs(dx) > threshold) {
+                            module.switchSession(dx < 0 ? 1 : -1, viewController, bindMethod);
+                        }
+                    }
+                    decided = false;
+                    horizontal = false;
+                    break;
+                }
+
+                case MotionEvent.ACTION_CANCEL:
+                    decided = false;
+                    horizontal = false;
+                    break;
+
+                default:
+                    break;
+            }
+            return false;
         }
     }
 
