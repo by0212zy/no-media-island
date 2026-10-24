@@ -570,14 +570,20 @@ public class NoMediaIsland extends XposedModule {
     private static volatile boolean gestureSwitched;
     /** 本次触摸是否落在媒体卡内（DOWN 时命中测试决定，MOVE/UP 沿用）。 */
     private static volatile boolean gestureOnCard;
+    /** 本次触摸是否落在进度条上（拖动调进度，绝不触发切卡手势）。 */
+    private static volatile boolean gestureOnSeek;
 
     // ===== 手势覆盖范围 + 页面指示器（原生 PageIndicator） =====
     /** 媒体卡片的外层控制器（MiuiMediaNotificationController），用于取 mediaContainerView。 */
     private static volatile Object layoutController = null;
     /** 外层容器是否已登记为手势区域。 */
     private static volatile boolean containerRegistered = false;
+    /** 当前登记的卡片 View（player），用于指示器日志核对。 */
+    private static volatile View currentPlayer = null;
     /** 原生 PageIndicator 实例（com.android.systemui.qs.PageIndicator）。 */
     private static volatile View pageIndicatorView = null;
+    /** 包裹 PageIndicator 的 FrameLayout，便于底部居中、兼容各种父容器。 */
+    private static volatile ViewGroup indicatorWrapper = null;
     /** PageIndicator 的 setNumPages / setLocation / setTintList 方法。 */
     private static volatile Method piSetNumPages = null;
     private static volatile Method piSetLocation = null;
@@ -663,6 +669,7 @@ public class NoMediaIsland extends XposedModule {
                                 CARD_VIEWS.put((View) player, Boolean.TRUE);
                                 cardViewController = vc;
                                 cardBindMethod = bindMediaData;
+                                currentPlayer = (View) player;
                                 // 指示器宿主：从 player 向上找第一层父容器（整卡容器）
                                 View parent = ((View) player).getParent() instanceof View
                                         ? (View) ((View) player).getParent() : null;
@@ -742,7 +749,12 @@ public class NoMediaIsland extends XposedModule {
      */
     private static void attachIndicator(View player) {
         try {
-            if (player.getParent() instanceof ViewGroup) {
+            // 优先挂进卡片本身（player），让指示器落在卡片底部那块原生空白里；
+            // player 此刻可能尚未真正加入布局，需在 post 后取 parent（参考 HyperLyric）。
+            if (player instanceof ViewGroup) {
+                attachIndicatorTo((ViewGroup) player,
+                        player.getContext(), player.getClass().getClassLoader());
+            } else if (player.getParent() instanceof ViewGroup) {
                 attachIndicatorTo((ViewGroup) player.getParent(),
                         player.getContext(), player.getClass().getClassLoader());
             } else {
@@ -753,43 +765,95 @@ public class NoMediaIsland extends XposedModule {
         }
     }
 
-    private static void attachIndicatorTo(ViewGroup parent, Context ctx, ClassLoader cl) {
+    private static void attachIndicatorTo(ViewGroup host, Context ctx, ClassLoader cl) {
         try {
-            // 向上找到承载指示器的 FrameLayout（系统媒体卡用 PageIndicator 底部居中）
-            ViewGroup frame = parent;
-            while (frame != null && !(frame instanceof FrameLayout)) {
-                View p = frame.getParent() instanceof View ? (View) frame.getParent() : null;
-                if (!(p instanceof ViewGroup)) {
-                    break;
-                }
-                frame = (ViewGroup) p;
-            }
-            if (!(frame instanceof FrameLayout)) {
-                Log.w(TAG, "[indicator] no FrameLayout parent for PageIndicator");
-                return;
-            }
-            if (pageIndicatorView != null && pageIndicatorView.getParent() == frame) {
-                return;
-            }
             if (pageIndicatorView == null) {
                 pageIndicatorView = createPageIndicator(ctx, cl);
-                if (pageIndicatorView == null) {
-                    return;
-                }
             }
-            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
-            lp.bottomMargin = (int) (4 * frame.getResources().getDisplayMetrics().density);
-            pageIndicatorView.setClickable(false);
-            pageIndicatorView.setFocusable(false);
-            pageIndicatorView.setFocusableInTouchMode(false);
-            frame.addView(pageIndicatorView, lp);
+            if (pageIndicatorView == null) {
+                return;
+            }
+            if (indicatorWrapper == null) {
+                FrameLayout wrap = new FrameLayout(ctx);
+                wrap.setClickable(false);
+                wrap.setFocusable(false);
+                wrap.setFocusableInTouchMode(false);
+                FrameLayout.LayoutParams ip = new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                ip.gravity = Gravity.CENTER;
+                wrap.addView(pageIndicatorView, ip);
+                pageIndicatorView.setClickable(false);
+                pageIndicatorView.setFocusable(false);
+                pageIndicatorView.setFocusableInTouchMode(false);
+                indicatorWrapper = wrap;
+            }
+            if (indicatorWrapper.getParent() == host) {
+                updateIndicator();
+                return;
+            }
+            if (indicatorWrapper.getParent() != null) {
+                ((ViewGroup) indicatorWrapper.getParent()).removeView(indicatorWrapper);
+            }
+            ViewGroup.LayoutParams lp = makeBottomParams(host, ctx);
+            host.addView(indicatorWrapper, lp);
             piPageCount = -1;
-            Log.i(TAG, "[indicator] PageIndicator attached to " + frame.getClass().getSimpleName());
+            Log.i(TAG, "[indicator] PageIndicator attached to "
+                    + host.getClass().getSimpleName()
+                    + " (hostIsCard=" + (host == currentPlayer) + ")");
             updateIndicator();
         } catch (Throwable t) {
             Log.w(TAG, "[indicator] attachTo: " + t);
+        }
+    }
+
+    /** 为指示器宿主构造「底部贴边、水平居中」的 LayoutParams，兼容常见容器。 */
+    private static ViewGroup.LayoutParams makeBottomParams(ViewGroup host, Context ctx) {
+        int margin = (int) (6 * ctx.getResources().getDisplayMetrics().density);
+        // 卡片根通常是 ConstraintLayout：底部/左右均贴父边（全宽），内部由 FrameLayout 居中
+        String name = host.getClass().getName();
+        if (name.contains("ConstraintLayout")) {
+            try {
+                Class<?> clp = Class.forName(
+                        "androidx.constraintlayout.widget.ConstraintLayout$LayoutParams");
+                ViewGroup.LayoutParams lp = (ViewGroup.LayoutParams)
+                        clp.getConstructor(int.class, int.class).newInstance(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.WRAP_CONTENT);
+                setIntField(lp, "bottomToBottom", 0); // 0 = parent
+                setIntField(lp, "startToStart", 0);
+                setIntField(lp, "endToEnd", 0);
+                setIntField(lp, "leftToLeft", 0);
+                setIntField(lp, "rightToRight", 0);
+                setIntField(lp, "topToBottom", -1);
+                setIntField(lp, "bottomMargin", margin);
+                return lp;
+            } catch (Throwable ignored) {
+            }
+        }
+        if (host instanceof FrameLayout) {
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+            lp.bottomMargin = margin;
+            return lp;
+        }
+        if (host instanceof LinearLayout) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+            lp.bottomMargin = margin;
+            return lp;
+        }
+        return new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+    }
+
+    private static void setIntField(Object obj, String fieldName, int value) {
+        try {
+            Field f = obj.getClass().getField(fieldName);
+            f.setAccessible(true);
+            f.set(obj, value);
+        } catch (Throwable ignored) {
         }
     }
 
@@ -828,7 +892,8 @@ public class NoMediaIsland extends XposedModule {
         mainHandler.post(() -> {
             try {
                 View pi = pageIndicatorView;
-                if (pi == null) {
+                View wrap = indicatorWrapper;
+                if (pi == null || wrap == null) {
                     return;
                 }
                 int count;
@@ -836,7 +901,7 @@ public class NoMediaIsland extends XposedModule {
                     count = SESSIONS.size();
                 }
                 if (count < 2) {
-                    pi.setVisibility(View.GONE);
+                    wrap.setVisibility(View.GONE);
                     piPageCount = -1;
                     return;
                 }
@@ -852,7 +917,7 @@ public class NoMediaIsland extends XposedModule {
                     piSetNumPages.invoke(pi, count);
                     piPageCount = count;
                 }
-                pi.setVisibility(View.VISIBLE);
+                wrap.setVisibility(View.VISIBLE);
                 if (piSetLocation != null) {
                     piSetLocation.invoke(pi, (float) activeIdx);
                 }
@@ -986,13 +1051,36 @@ public class NoMediaIsland extends XposedModule {
 
     /** 进度条（SeekBar 及其子类）上的触摸应放行给原生拖动，不触发切卡手势。 */
     private static boolean isOnSeekBar(View v) {
+        // 向上：被触摸的 view 自身/祖先是 SeekBar（HyperOS 用 miuix 的 HyperProgressSeekBar）
         Class<?> c = v.getClass();
         while (c != null) {
-            String n = c.getName();
-            if (n.endsWith("SeekBar")) {
+            if (c.getName().endsWith("SeekBar") || c.getName().endsWith("ProgressBar")) {
                 return true;
             }
             c = c.getSuperclass();
+        }
+        // 向下：触摸目标可能是进度条的父/兄弟容器，向下找有没有进度条子孙
+        if (v instanceof ViewGroup) {
+            return viewGroupHasSeekBar((ViewGroup) v, 4);
+        }
+        return false;
+    }
+
+    private static boolean viewGroupHasSeekBar(ViewGroup g, int depth) {
+        if (depth <= 0) return false;
+        for (int i = 0; i < g.getChildCount(); i++) {
+            View child = g.getChildAt(i);
+            if (child == null) continue;
+            Class<?> c = child.getClass();
+            while (c != null) {
+                if (c.getName().endsWith("SeekBar") || c.getName().endsWith("ProgressBar")) {
+                    return true;
+                }
+                c = c.getSuperclass();
+            }
+            if (child instanceof ViewGroup && viewGroupHasSeekBar((ViewGroup) child, depth - 1)) {
+                return true;
+            }
         }
         return false;
     }
@@ -1015,12 +1103,17 @@ public class NoMediaIsland extends XposedModule {
                         MotionEvent ev = (MotionEvent) chain.getArgs().get(0);
                         int action = ev.getActionMasked();
                         try {
-                            if (action == MotionEvent.ACTION_DOWN) {
-                                // 进度条区域不触发切换手势，保留原生拖动调进度
+                                if (action == MotionEvent.ACTION_DOWN) {
+                                // 进度条区域不触发切换手势，保留原生拖动调进度。
+                                // 进度条是 miuix 的 HyperProgressSeekBar，且触摸目标可能是它的
+                                // 父容器/子 View，所以向上（祖先）和向下（后代）都查一遍。
                                 if (isOnSeekBar(self)) {
                                     gestureOnCard = false;
+                                    gestureOnSeek = true;
+                                    log(Log.INFO, TAG, "[switcher] seek touch, gesture skipped");
                                     return chain.proceed();
                                 }
+                                gestureOnSeek = false;
                                 // 命中测试：从被触摸的 view 向上爬祖先，
                                 // 落到任一登记的媒体卡（player 或整卡容器）子树内即视为卡内。
                                 // 这样封面/标题/边距/下方空白上的触摸都能触发手势，
@@ -1073,17 +1166,19 @@ public class NoMediaIsland extends XposedModule {
 
                                 case MotionEvent.ACTION_UP:
                                 case MotionEvent.ACTION_CANCEL: {
-                                    if (gestureHorizontal) {
+                                    if (gestureHorizontal && !gestureOnSeek) {
                                         // 关键：滑动后必须消费掉 UP，
                                         // 否则事件被卡片当成「点击」→ 打开下一个媒体卡片的 App
                                         gestureDecided = false;
                                         gestureHorizontal = false;
                                         gestureSwitched = false;
+                                        gestureOnSeek = false;
                                         return Boolean.TRUE;
                                     }
                                     gestureDecided = false;
                                     gestureHorizontal = false;
                                     gestureSwitched = false;
+                                    gestureOnSeek = false;
                                     break;
                                 }
 
