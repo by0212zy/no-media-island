@@ -46,7 +46,8 @@ private static final Set<String> BLOCKED_PACKAGES = Set.of(
 
 ## 构建
 
-- 需要 **Android SDK（compileSdk 37 / build-tools 35.0.0+）** 与 **JDK 17+**。
+- 需要 **Android SDK（compileSdk 36 / build-tools 35.0.0+）** 与 **JDK 17+**。
+- 依赖 `io.github.libxposed:api:101.0.1`（aar 要求 `compileSdk ≥ 36`）。
 - 本项目自带 Gradle 8.10.2 wrapper（AGP 8.7.0 兼容 Gradle 8.9–8.11，不兼容 Gradle 9）。
 - 用 Android Studio 打开根目录直接构建，或在命令行：
 
@@ -54,6 +55,12 @@ private static final Set<String> BLOCKED_PACKAGES = Set.of(
 export ANDROID_HOME=/path/to/android-sdk
 ./gradlew assembleDebug        # 生成未签名的模块 APK
 ```
+
+> 关于版本：libxposed API 最新稳定版是 `102.0.0`，但它的 aar 要求 `compileSdk ≥ 37`
+> （需本地装有 `android-37` 平台）。本仓库默认用 `101.0.1`（`minCompileSdk = 36`）以保证在只装到
+> `android-36` 的 SDK 上也能编译。若你的 SDK 已含 android-37，把 `app/build.gradle.kts` 里的
+> `api:101.0.1` 改回 `api:102.0.0`、`compileSdk/targetSdk` 改回 `37`、`module.prop` 改回 `101→102`
+> 即可，模块源码无需任何改动（两个版本的 Hook API 完全一致）。
 
 产物在 `app/build/outputs/apk/debug/app-debug.apk`。
 

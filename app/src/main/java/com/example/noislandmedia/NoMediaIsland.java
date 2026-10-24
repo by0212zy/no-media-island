@@ -2,8 +2,6 @@ package com.example.noislandmedia;
 
 import android.util.Log;
 
-import androidx.annotation.NonNull;
-
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
@@ -44,7 +42,7 @@ public class NoMediaIsland extends XposedModule {
     );
 
     @Override
-    public void onPackageReady(@NonNull XposedModuleInterface.PackageReadyParam param) {
+    public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
         // 仅对 SystemUI 生效
         if (!SYSTEMUI.equals(param.getPackageName())) {
             return;

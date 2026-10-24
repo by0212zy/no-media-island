@@ -1,16 +1,17 @@
 plugins {
-    // 注意：libxposed api:102.0.0 的 aar 要求 compileSdk >= 37
+    // libxposed api:101.0.1 的 aar 要求 compileSdk >= 36
+    // （最新版 102.0.0 要求 compileSdk >= 37，需本地装有 android-37 平台；若已安装可改回 102.0.0）
     id("com.android.application") version "8.7.0"
 }
 
 android {
     namespace = "com.example.noislandmedia"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.example.noislandmedia"
         minSdk = 26
-        targetSdk = 37
+        targetSdk = 36
         versionCode = 1
         versionName = "1.0"
     }
@@ -43,5 +44,5 @@ android {
 
 dependencies {
     // 现代 libxposed API（仅编译期需要，运行期由框架提供）
-    compileOnly("io.github.libxposed:api:102.0.0")
+    compileOnly("io.github.libxposed:api:101.0.1")
 }
