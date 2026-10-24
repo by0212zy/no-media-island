@@ -541,8 +541,13 @@ public class NoMediaIsland extends XposedModule {
     /** 当前卡片正在控制的会话 key。 */
     private static volatile String currentSessionKey = null;
 
-    /** 媒体卡 View（holder.player），用于身份判断限定手势范围。 */
-    private static volatile View mediaCardView = null;
+    /**
+     * 所有登记过的媒体卡 View（弱引用集合）。
+     * HyperOS 会为不同形态（正常/迷你/锁屏）各调用一次 attach，
+     * 只记一个会记错（v1.13 的「划不动」就是这么来的），所以全部登记，任一命中即处理。
+     */
+    private static final Map<View, Boolean> CARD_VIEWS =
+            Collections.synchronizedMap(new java.util.WeakHashMap<View, Boolean>());
     /** 卡片对应的视图控制器与其 bindMediaData。 */
     private static volatile Object cardViewController = null;
     private static volatile Method cardBindMethod = null;
@@ -624,10 +629,11 @@ public class NoMediaIsland extends XposedModule {
                             Object holder = chain.getArgs().get(0);
                             Object player = playerField.get(holder);
                             if (vc != null && player instanceof View) {
-                                mediaCardView = (View) player;
+                                CARD_VIEWS.put((View) player, Boolean.TRUE);
                                 cardViewController = vc;
                                 cardBindMethod = bindMediaData;
-                                log(Log.INFO, TAG, "[switcher] media card registered");
+                                log(Log.INFO, TAG, "[switcher] media card registered (total="
+                                        + CARD_VIEWS.size() + ")");
                             }
                         } catch (Throwable t) {
                             log(Log.WARN, TAG, "[switcher] attach capture failed: " + t);
@@ -772,14 +778,14 @@ public class NoMediaIsland extends XposedModule {
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept((XposedInterface.Chain chain) -> {
                         View self = (View) chain.getThisObject();
-                        View card = mediaCardView;
-                        if (self == null || card == null || self != card) {
+                        if (self == null || CARD_VIEWS.isEmpty() || !CARD_VIEWS.containsKey(self)) {
                             return chain.proceed();
                         }
                         MotionEvent ev = (MotionEvent) chain.getArgs().get(0);
                         try {
                             switch (ev.getActionMasked()) {
                                 case MotionEvent.ACTION_DOWN:
+                                    log(Log.INFO, TAG, "[switcher] gesture down on card");
                                     gestureDownX = ev.getRawX();
                                     gestureDownY = ev.getRawY();
                                     gestureDecided = false;
