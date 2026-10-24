@@ -29,8 +29,19 @@ import java.util.Set;
  * 当媒体特性开启且 {@code Flags.notificationsBackgroundIcons()} 为 true 时，
  * 媒体通知会从正常状态栏图标列表被抽走、挪到「背景图标」区（该位置原本就是由岛显示的）。
  * v1.3 对该方法 hook：对<b>媒体通知</b>强制返回 {@code false}（不抽走），
- * 让音乐 App 的状态栏图标正常显示，同时保留下拉栏的媒体卡。
- * 注：该方法同时管下拉栏列表，理论上有极小概率导致下拉栏出现重复媒体卡；若真出现，反馈后我再细化。
+ * 让音乐 App 的状态栏图标正常显示。
+ *
+ * <p>v1.4 新增（针对「下拉栏出现两张音乐卡片」+ 对齐 HyperOS 2.0.212 的效果）：
+ * 对比 2.0.212 与 3.0.3 的 SystemUI 得到关键差异——
+ *   2.0.212：<b>不存在</b> MiuiIslandMediaController / DynamicIslandContent /
+ *            MiuiIslandMediaViewBinder / MiuiMediaNotificationController（即没有媒体岛整套东西）。
+ *   3.0.3  ：新增了上述组件。其中 {@code MiuiMediaNotificationController} 被
+ *            {@code MiuiNotificationSectionsManager.reinflateViews} 持有，是通知中心里的一个 section，
+ *            也就是那张「系统风格媒体卡」（用户不想要的那张）。
+ * 放行 {@code shouldFilterOut} 后，通知中心会同时出现「音乐 App 自己的原始通知」+「系统风格媒体卡」两张。
+ * 因此 v1.4 在 {@code MediaDataManager.onNotificationAdded} 处对媒体通知直接跳过，
+ * 不再生成 MediaData → 系统风格媒体卡消失，只留音乐 App 自己的通知 + 状态栏图标，
+ * 与 2.0.212 的表现一致。
  */
 public class NoMediaIsland extends XposedModule {
 
@@ -166,6 +177,9 @@ public class NoMediaIsland extends XposedModule {
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "hook failed: " + t);
         }
+
+        // (4) 去掉「系统风格媒体卡」：不再为媒体通知生成 MediaData（对齐 2.0.212）
+        hookMediaDataCreation(cl);
     }
 
     /**
@@ -220,6 +234,68 @@ public class NoMediaIsland extends XposedModule {
             log(Log.INFO, TAG, "deoptimize shouldFilterOut -> " + deoptimize(shouldFilterOut));
         } catch (Throwable t) {
             log(Log.WARN, TAG, "hook statusbar media icon failed: " + t);
+        }
+    }
+
+    /**
+     * 去掉 3.0.3 新增的「系统风格媒体卡」，对齐 2.0.212 的效果。
+     *
+     * <p>3.0.3 会为媒体通知生成 {@code MediaData}，进而由 {@code MiuiMediaNotificationController}
+     * （被 {@code MiuiNotificationSectionsManager} 持有的通知中心 section）渲染出一张系统风格媒体卡，
+     * 与音乐 App 自己的原始通知重复。2.0.212 根本没有这些组件，所以只有 App 自己的通知。
+     *
+     * <p>这里在 {@code MediaDataManager.onNotificationAdded} 处对媒体通知直接跳过（void 方法不 proceed 即阻断），
+     * 不再生成 MediaData，系统风格媒体卡随之消失，只保留音乐 App 自己的通知 + 状态栏图标。
+     */
+    private void hookMediaDataCreation(ClassLoader cl) {
+        try {
+            Class<?> mdmCls = Class.forName(
+                    "com.android.systemui.media.controls.domain.pipeline.MediaDataManager", false, cl);
+            Class<?> sbnCls = Class.forName(
+                    "android.service.notification.StatusBarNotification", false, cl);
+
+            Method onAdded = mdmCls.getMethod("onNotificationAdded", sbnCls, String.class);
+            Method isMedia = mdmCls.getDeclaredMethod("isMediaNotification", sbnCls);
+
+            hook(onAdded)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept((XposedInterface.Chain chain) -> {
+                        Object sbn = chain.getArgs().get(0);
+                        try {
+                            if (sbn != null
+                                    && Boolean.TRUE.equals(isMedia.invoke(null, sbn))
+                                    && shouldBlock(sbn)) {
+                                log(Log.INFO, TAG,
+                                        "[mediadata] skip MediaData -> keep only app's own notification");
+                                return null; // void 方法：不 proceed 即阻断
+                            }
+                        } catch (Throwable t) {
+                            log(Log.WARN, TAG, "[mediadata] check failed: " + t);
+                        }
+                        return chain.proceed();
+                    });
+
+            log(Log.INFO, TAG, "hooked MediaDataManager.onNotificationAdded");
+            log(Log.INFO, TAG, "deoptimize onNotificationAdded -> " + deoptimize(onAdded));
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "hook MediaDataManager.onNotificationAdded failed: " + t);
+        }
+    }
+
+    /**
+     * 是否应拦掉该媒体通知的 MediaData。
+     * 与「不上岛」的过滤策略保持一致：默认拦所有媒体；ONLY_BLOCK_LISTED 为 true 时只拦指定音乐 App。
+     */
+    private static boolean shouldBlock(Object sbn) {
+        if (!ONLY_BLOCK_LISTED) {
+            return true;
+        }
+        try {
+            Method m = sbn.getClass().getMethod("getPackageName");
+            Object pkg = m.invoke(sbn);
+            return pkg instanceof String && BLOCKED_PACKAGES.contains((String) pkg);
+        } catch (Throwable ignored) {
+            return true;
         }
     }
 
