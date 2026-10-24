@@ -566,6 +566,8 @@ public class NoMediaIsland extends XposedModule {
     private static volatile boolean gestureHorizontal;
     /** 本次手势是否已切换过（避免一次滑动连续切多张）。 */
     private static volatile boolean gestureSwitched;
+    /** 本次触摸是否落在媒体卡内（DOWN 时命中测试决定，MOVE/UP 沿用）。 */
+    private static volatile boolean gestureOnCard;
 
     // ===== 手势覆盖范围 + 页面指示器 =====
     /** 媒体卡片的外层控制器（MiuiMediaNotificationController），用于取 mediaContainerView。 */
@@ -655,8 +657,17 @@ public class NoMediaIsland extends XposedModule {
                                 CARD_VIEWS.put((View) player, Boolean.TRUE);
                                 cardViewController = vc;
                                 cardBindMethod = bindMediaData;
+                                // 指示器宿主：从 player 向上找第一层父容器（整卡容器）
+                                View parent = ((View) player).getParent() instanceof View
+                                        ? (View) ((View) player).getParent() : null;
+                                if (parent instanceof ViewGroup) {
+                                    indicatorHost = (ViewGroup) parent;
+                                    // 把整卡容器也纳入命中测试，使卡片任意位置（含下方空白）都能滑
+                                    CARD_VIEWS.put(parent, Boolean.TRUE);
+                                }
                                 log(Log.INFO, TAG, "[switcher] media card registered (total="
                                         + CARD_VIEWS.size() + ")");
+                                updateIndicator();
                             }
                         } catch (Throwable t) {
                             log(Log.WARN, TAG, "[switcher] attach capture failed: " + t);
@@ -709,7 +720,7 @@ public class NoMediaIsland extends XposedModule {
             Object v = f.get(layoutController);
             if (v instanceof View) {
                 CARD_VIEWS.put((View) v, Boolean.TRUE);
-                if (v instanceof ViewGroup) {
+                if (indicatorHost == null && v instanceof ViewGroup) {
                     indicatorHost = (ViewGroup) v;
                 }
                 containerRegistered = true;
@@ -902,8 +913,29 @@ public class NoMediaIsland extends XposedModule {
     }
 
     /**
-     * 挂 {@code View.dispatchTouchEvent} 并用身份判断只处理媒体卡。
-     * 非媒体卡的事件直接放行（开销仅一次引用比较）。
+     * 命中测试：从 view 向上爬祖先链，若落在任一登记的媒体卡（player 或整卡容器）子树内则命中。
+     * 用整棵子树判定，封面/标题/边距/下方空白等任意子 View 上的触摸都会被计入卡内，
+     * 而通知列表里其它行不会（它们的祖先链碰不到登记的卡）。
+     */
+    private static boolean isInsideCard(View v) {
+        if (CARD_VIEWS.isEmpty() || v == null) {
+            return false;
+        }
+        View p = v;
+        while (p != null) {
+            if (CARD_VIEWS.containsKey(p)) {
+                return true;
+            }
+            Object parent = p.getParent();
+            p = (parent instanceof View) ? (View) parent : null;
+        }
+        return false;
+    }
+
+    /**
+     * 挂 {@code View.dispatchTouchEvent} 用命中测试处理整张媒体卡的手势。
+     * 卡片内任意子 View 上的触摸都会作为 self 经过本钩子；命中卡内后，
+     * 本次手势的 MOVE/UP 均按横向滑动处理（滑到子 View 也不丢手势）。
      */
     private void hookViewDispatchTouch() {
         try {
@@ -912,25 +944,32 @@ public class NoMediaIsland extends XposedModule {
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept((XposedInterface.Chain chain) -> {
                         View self = (View) chain.getThisObject();
-                        // 把媒体卡片外层容器也纳入手势区域：
-                        // player 只覆盖卡片内部一部分，外圈/空白处属于容器，
-                        // 不登记的话那里滑动会被通知的侧滑接管（表现为"只有标题位置能滑"）。
-                        ensureContainerRegistered();
-                        if (self == null || CARD_VIEWS.isEmpty() || !CARD_VIEWS.containsKey(self)) {
+                        if (self == null) {
                             return chain.proceed();
                         }
                         MotionEvent ev = (MotionEvent) chain.getArgs().get(0);
+                        int action = ev.getActionMasked();
                         try {
-                            switch (ev.getActionMasked()) {
-                                case MotionEvent.ACTION_DOWN:
-                                    log(Log.INFO, TAG, "[switcher] gesture down on card");
+                            if (action == MotionEvent.ACTION_DOWN) {
+                                // 命中测试：从被触摸的 view 向上爬祖先，
+                                // 落到任一登记的媒体卡（player 或整卡容器）子树内即视为卡内。
+                                // 这样封面/标题/边距/下方空白上的触摸都能触发手势，
+                                // 且不会误触通知列表里的其它行。
+                                gestureOnCard = isInsideCard(self);
+                                if (gestureOnCard) {
                                     gestureDownX = ev.getRawX();
                                     gestureDownY = ev.getRawY();
                                     gestureDecided = false;
                                     gestureHorizontal = false;
                                     gestureSwitched = false;
-                                    break;
-
+                                    log(Log.INFO, TAG, "[switcher] gesture down on card");
+                                }
+                                return chain.proceed();
+                            }
+                            if (!gestureOnCard) {
+                                return chain.proceed();
+                            }
+                            switch (action) {
                                 case MotionEvent.ACTION_MOVE: {
                                     float dx = ev.getRawX() - gestureDownX;
                                     float dy = ev.getRawY() - gestureDownY;
@@ -979,7 +1018,7 @@ public class NoMediaIsland extends XposedModule {
                                 }
 
                                 default:
-                                    break;
+                                    return Boolean.TRUE;
                             }
                         } catch (Throwable t) {
                             log(Log.WARN, TAG, "[switcher] gesture error: " + t);
