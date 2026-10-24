@@ -178,8 +178,8 @@ public class NoMediaIsland extends XposedModule {
             log(Log.ERROR, TAG, "hook failed: " + t);
         }
 
-        // (4) 去掉「系统风格媒体卡」：不再为媒体通知生成 MediaData（对齐 2.0.212）
-        hookMediaDataCreation(cl);
+        // (4) 隐藏「丑的原始通知行」：保留 MediaData 美化卡 + 状态栏图标（对齐 2.0.212）
+        hookHideRawMediaRow(cl);
     }
 
     /**
@@ -238,47 +238,73 @@ public class NoMediaIsland extends XposedModule {
     }
 
     /**
-     * 去掉 3.0.3 新增的「系统风格媒体卡」，对齐 2.0.212 的效果。
+     * 隐藏 3.0.3 里「未美化的原始通知行」，只保留美化卡 + 状态栏图标（对齐 2.0.212）。
      *
-     * <p>3.0.3 会为媒体通知生成 {@code MediaData}，进而由 {@code MiuiMediaNotificationController}
-     * （被 {@code MiuiNotificationSectionsManager} 持有的通知中心 section）渲染出一张系统风格媒体卡，
-     * 与音乐 App 自己的原始通知重复。2.0.212 根本没有这些组件，所以只有 App 自己的通知。
+     * <p>背景：3.0.3 的「美化媒体卡」来自 {@code MediaData} → {@code MiuiMediaNotificationController}
+     * （配 {@code MiuiMediaViewController} / {@code MiuiMediaViewHolder} / {@code MiuiMediaAlbumAnimationUtils}）。
+     * 而 v1.3 为拿回状态栏图标放行了 {@code shouldFilterOut}，导致原始裸通知也进了下拉栏——
+     * 那是未美化的，所以「很丑」，且和美化卡重复。
      *
-     * <p>这里在 {@code MediaDataManager.onNotificationAdded} 处对媒体通知直接跳过（void 方法不 proceed 即阻断），
-     * 不再生成 MediaData，系统风格媒体卡随之消失，只保留音乐 App 自己的通知 + 状态栏图标。
+     * <p>状态栏图标由独立的 {@code IconManager} 管理，与通知行渲染解耦，
+     * 因此这里跳过 {@code NotificationRowBinderImpl.inflateViews}（void 方法不 proceed 即阻断），
+     * 让原始丑行不渲染；美化卡与状态栏图标都保留，效果与 2.0.212 一致。
      */
-    private void hookMediaDataCreation(ClassLoader cl) {
+    private void hookHideRawMediaRow(ClassLoader cl) {
         try {
-            Class<?> mdmCls = Class.forName(
-                    "com.android.systemui.media.controls.domain.pipeline.MediaDataManager", false, cl);
+            Class<?> binderCls = Class.forName(
+                    "com.android.systemui.statusbar.notification.collection.inflation.NotificationRowBinderImpl",
+                    false, cl);
+            Class<?> entryCls = Class.forName(
+                    "com.android.systemui.statusbar.notification.collection.NotificationEntry",
+                    false, cl);
             Class<?> sbnCls = Class.forName(
                     "android.service.notification.StatusBarNotification", false, cl);
-
-            Method onAdded = mdmCls.getMethod("onNotificationAdded", sbnCls, String.class);
+            Class<?> mdmCls = Class.forName(
+                    "com.android.systemui.media.controls.domain.pipeline.MediaDataManager", false, cl);
             Method isMedia = mdmCls.getDeclaredMethod("isMediaNotification", sbnCls);
 
-            hook(onAdded)
+            // 按名字找 inflateViews，避免依赖内部类参数类型的精确签名
+            Method inflateViews = null;
+            for (Method m : binderCls.getDeclaredMethods()) {
+                if ("inflateViews".equals(m.getName())) {
+                    if (m.getParameterTypes().length == 3) {
+                        inflateViews = m;
+                        break;
+                    }
+                }
+            }
+            if (inflateViews == null) {
+                log(Log.WARN, TAG, "inflateViews not found");
+                return;
+            }
+
+            hook(inflateViews)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept((XposedInterface.Chain chain) -> {
-                        Object sbn = chain.getArgs().get(0);
+                        Object entry = chain.getArgs().get(0);
                         try {
-                            if (sbn != null
-                                    && Boolean.TRUE.equals(isMedia.invoke(null, sbn))
-                                    && shouldBlock(sbn)) {
-                                log(Log.INFO, TAG,
-                                        "[mediadata] skip MediaData -> keep only app's own notification");
-                                return null; // void 方法：不 proceed 即阻断
+                            Field f = findField(entryCls, "mSbn");
+                            if (f != null) {
+                                f.setAccessible(true);
+                                Object sbn = f.get(entry);
+                                if (sbn != null
+                                        && Boolean.TRUE.equals(isMedia.invoke(null, sbn))
+                                        && shouldBlock(sbn)) {
+                                    log(Log.INFO, TAG,
+                                            "[row] skip raw media row -> keep beautified card + icon");
+                                    return null; // void 方法：不 proceed 即阻断
+                                }
                             }
                         } catch (Throwable t) {
-                            log(Log.WARN, TAG, "[mediadata] check failed: " + t);
+                            log(Log.WARN, TAG, "[row] check failed: " + t);
                         }
                         return chain.proceed();
                     });
 
-            log(Log.INFO, TAG, "hooked MediaDataManager.onNotificationAdded");
-            log(Log.INFO, TAG, "deoptimize onNotificationAdded -> " + deoptimize(onAdded));
+            log(Log.INFO, TAG, "hooked NotificationRowBinderImpl.inflateViews");
+            log(Log.INFO, TAG, "deoptimize inflateViews -> " + deoptimize(inflateViews));
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "hook MediaDataManager.onNotificationAdded failed: " + t);
+            log(Log.WARN, TAG, "hook inflateViews failed: " + t);
         }
     }
 
