@@ -556,6 +556,8 @@ public class NoMediaIsland extends XposedModule {
     private static volatile float gestureDownY;
     private static volatile boolean gestureDecided;
     private static volatile boolean gestureHorizontal;
+    /** 本次手势是否已切换过（避免一次滑动连续切多张）。 */
+    private static volatile boolean gestureSwitched;
 
     /**
      * 在 HyperOS 3 的 MIUI 媒体卡上实现<b>横滑切换媒体会话</b>（MIUI 同款多会话管理）。
@@ -790,12 +792,15 @@ public class NoMediaIsland extends XposedModule {
                                     gestureDownY = ev.getRawY();
                                     gestureDecided = false;
                                     gestureHorizontal = false;
+                                    gestureSwitched = false;
                                     break;
 
                                 case MotionEvent.ACTION_MOVE: {
                                     float dx = ev.getRawX() - gestureDownX;
                                     float dy = ev.getRawY() - gestureDownY;
-                                    float slop = 8f * self.getResources().getDisplayMetrics().density;
+                                    float density =
+                                            self.getResources().getDisplayMetrics().density;
+                                    float slop = 6f * density;
                                     if (!gestureDecided) {
                                         if (Math.max(Math.abs(dx), Math.abs(dy)) < slop) break;
                                         gestureDecided = true;
@@ -806,31 +811,36 @@ public class NoMediaIsland extends XposedModule {
                                         if (self.getParent() != null) {
                                             self.getParent().requestDisallowInterceptTouchEvent(true);
                                         }
-                                        return Boolean.TRUE; // 消费掉，继续收后续事件
-                                    }
-                                    break;
-                                }
-
-                                case MotionEvent.ACTION_UP: {
-                                    if (gestureHorizontal) {
-                                        float dx = ev.getRawX() - gestureDownX;
-                                        float threshold = Math.max(
-                                                self.getWidth() * 0.12f,
-                                                40f * self.getResources().getDisplayMetrics().density);
-                                        if (Math.abs(dx) > threshold) {
-                                            switchSession(dx < 0 ? 1 : -1,
-                                                    cardViewController, cardBindMethod);
+                                        // 滑到阈值立刻切换（更跟手），每次手势只切一次
+                                        if (!gestureSwitched) {
+                                            float threshold = Math.max(
+                                                    self.getWidth() * 0.08f, 24f * density);
+                                            if (Math.abs(dx) > threshold) {
+                                                switchSession(dx < 0 ? 1 : -1,
+                                                        cardViewController, cardBindMethod);
+                                                gestureSwitched = true;
+                                            }
                                         }
+                                        return Boolean.TRUE; // 消费掉，后续事件继续由我们处理
                                     }
-                                    gestureDecided = false;
-                                    gestureHorizontal = false;
                                     break;
                                 }
 
-                                case MotionEvent.ACTION_CANCEL:
+                                case MotionEvent.ACTION_UP:
+                                case MotionEvent.ACTION_CANCEL: {
+                                    if (gestureHorizontal) {
+                                        // 关键：滑动后必须消费掉 UP，
+                                        // 否则事件被卡片当成「点击」→ 打开下一个媒体卡片的 App
+                                        gestureDecided = false;
+                                        gestureHorizontal = false;
+                                        gestureSwitched = false;
+                                        return Boolean.TRUE;
+                                    }
                                     gestureDecided = false;
                                     gestureHorizontal = false;
+                                    gestureSwitched = false;
                                     break;
+                                }
 
                                 default:
                                     break;
