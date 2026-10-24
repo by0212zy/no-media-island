@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NoMediaIsland</string>
+    <string name="xposed_description">屏蔽音乐等媒体进入 HyperOS「超级岛 / 通知岛」，让音乐 App 使用自身播放通知（通知栏媒体卡片不受影响）。</string>
+</resources>
