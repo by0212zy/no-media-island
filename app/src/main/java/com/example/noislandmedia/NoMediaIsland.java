@@ -178,7 +178,10 @@ public class NoMediaIsland extends XposedModule {
             log(Log.ERROR, TAG, "hook failed: " + t);
         }
 
-        // (4) 隐藏 App 裸通知那一行（行仍渲染→状态栏图标保留），改由 SystemUI 媒体卡呈现
+        // (4) 停用 3.0.3 的 MIUI 卡（miui_media_session.xml），改走 2.0.212 的标准卡
+        hookDisableMiuiMediaCard(cl);
+
+        // (5) 隐藏 App 裸通知那一行（行仍渲染→状态栏图标保留）
         hookHideRawMediaRow(cl);
     }
 
@@ -300,6 +303,54 @@ public class NoMediaIsland extends XposedModule {
             log(Log.INFO, TAG, "deoptimize onAttachedToWindow -> " + deoptimize(onAttach));
         } catch (Throwable t) {
             log(Log.WARN, TAG, "hook hide raw media row failed: " + t);
+        }
+    }
+
+    /**
+     * 停用 3.0.3 的 MIUI 媒体卡 {@code MiuiMediaNotificationController}
+     * （它用 {@code miui_media_session.xml}，2.0.212 无此布局），
+     * 让媒体改由标准 {@code MediaCarouselController} 的
+     * {@code media_session_view.xml} 呈现，即 2.0.212 的标准卡。
+     *
+     * <p>拦它的两个数据入口（void 方法不 proceed 即阻断）：
+     * <ul>
+     *   <li>{@code MiuiMediaNotificationController$mediaDataListener$1.onMediaDataLoaded}</li>
+     *   <li>{@code MiuiMediaNotificationController$MediaDataChangeListener.onMediaDataChanged}</li>
+     * </ul>
+     */
+    private void hookDisableMiuiMediaCard(ClassLoader cl) {
+        String[][] specs = {
+                {"com.android.systemui.statusbar.notification.mediacontrol"
+                        + ".MiuiMediaNotificationController$mediaDataListener$1", "onMediaDataLoaded"},
+                {"com.android.systemui.statusbar.notification.mediacontrol"
+                        + ".MiuiMediaNotificationController$MediaDataChangeListener", "onMediaDataChanged"},
+        };
+        for (String[] spec : specs) {
+            try {
+                Class<?> c = Class.forName(spec[0], false, cl);
+                Method m = null;
+                for (Method mm : c.getDeclaredMethods()) {
+                    if (spec[1].equals(mm.getName())) {
+                        m = mm;
+                        break;
+                    }
+                }
+                if (m == null) {
+                    log(Log.WARN, TAG, "miui card method not found: " + spec[1]);
+                    continue;
+                }
+                hook(m)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept((XposedInterface.Chain chain) -> {
+                            log(Log.INFO, TAG, "[miuicard] block " + spec[1] + " -> use standard card");
+                            return null; // void 方法：不 proceed 即阻断
+                        });
+                log(Log.INFO, TAG, "hooked " + spec[0].substring(spec[0].lastIndexOf('.') + 1)
+                        + "." + spec[1] + " (MIUI card disabled)");
+                log(Log.INFO, TAG, "deoptimize " + spec[1] + " -> " + deoptimize(m));
+            } catch (Throwable t) {
+                log(Log.WARN, TAG, "disable MIUI media card failed: " + spec[1] + " (" + t + ")");
+            }
         }
     }
 
