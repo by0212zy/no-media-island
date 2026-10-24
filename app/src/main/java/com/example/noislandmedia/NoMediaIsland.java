@@ -23,6 +23,14 @@ import java.util.Set;
  *   (1) 继续 hook 3 参 {@code addDynamicIslandView} 并 deoptimize 其调用方；
  *   (2) 直接在「真正落岛」的接口方法 {@code DynamicIslandContent.addDynamicIslandView / updateDynamicIslandView}
  *       上 hook，只要调用方来自 {@code MiuiIslandMediaController}（即媒体）就拦截，物理上无法被内联绕过。
+ *
+ * <p>v1.3 新增（针对「媒体不上岛了，但状态栏也没有音乐图标」）：
+ * 反编译发现状态栏媒体图标被 {@code MediaCoordinator$1.shouldFilterOut} 过滤掉——
+ * 当媒体特性开启且 {@code Flags.notificationsBackgroundIcons()} 为 true 时，
+ * 媒体通知会从正常状态栏图标列表被抽走、挪到「背景图标」区（该位置原本就是由岛显示的）。
+ * v1.3 对该方法 hook：对<b>媒体通知</b>强制返回 {@code false}（不抽走），
+ * 让音乐 App 的状态栏图标正常显示，同时保留下拉栏的媒体卡。
+ * 注：该方法同时管下拉栏列表，理论上有极小概率导致下拉栏出现重复媒体卡；若真出现，反馈后我再细化。
  */
 public class NoMediaIsland extends XposedModule {
 
@@ -152,9 +160,80 @@ public class NoMediaIsland extends XposedModule {
                 log(Log.INFO, TAG, "deoptimize iface.update -> " + deoptimize(imUpd));
             } catch (Throwable ignored) {}
 
+            // (3) 状态栏音乐图标：让媒体通知不被从状态栏图标列表抽走
+            hookStatusBarMediaIcon(cl);
+
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "hook failed: " + t);
         }
+    }
+
+    /**
+     * 恢复媒体通知的状态栏图标。
+     * {@code MediaCoordinator$1.shouldFilterOut} 在媒体特性开启 + 背景图标特性开启时，
+     * 会把媒体通知从正常状态栏图标列表过滤掉（挪到背景图标区，该位置原本由岛显示）。
+     * 这里对媒体通知强制返回 false（不抽走），让音乐 App 图标正常显示在状态栏。
+     */
+    private void hookStatusBarMediaIcon(ClassLoader cl) {
+        try {
+            Class<?> coordinatorCls = Class.forName(
+                    "com.android.systemui.statusbar.notification.collection.coordinator.MediaCoordinator$1",
+                    false, cl);
+            Class<?> entryCls = Class.forName(
+                    "com.android.systemui.statusbar.notification.collection.NotificationEntry",
+                    false, cl);
+            Class<?> sbnCls = Class.forName(
+                    "android.service.notification.StatusBarNotification", false, cl);
+            Class<?> mdmCls = Class.forName(
+                    "com.android.systemui.media.controls.domain.pipeline.MediaDataManager",
+                    false, cl);
+
+            Method shouldFilterOut = coordinatorCls.getDeclaredMethod(
+                    "shouldFilterOut", entryCls, long.class);
+            Method isMediaNotification = mdmCls.getDeclaredMethod(
+                    "isMediaNotification", sbnCls);
+
+            hook(shouldFilterOut)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept((XposedInterface.Chain chain) -> {
+                        Object entry = chain.getArgs().get(0);
+                        try {
+                            // NotificationEntry.mSbn : StatusBarNotification (实际为 ExpandedNotification 子类)
+                            Field sbnField = findField(entryCls, "mSbn");
+                            if (sbnField != null) {
+                                sbnField.setAccessible(true);
+                                Object sbn = sbnField.get(entry);
+                                if (sbn != null
+                                        && Boolean.TRUE.equals(isMediaNotification.invoke(null, sbn))) {
+                                    log(Log.INFO, TAG, "[statusbar] media -> keep icon (not filtered)");
+                                    return Boolean.FALSE;
+                                }
+                            }
+                        } catch (Throwable t) {
+                            log(Log.WARN, TAG, "[statusbar] check failed: " + t);
+                        }
+                        return chain.proceed();
+                    });
+
+            log(Log.INFO, TAG, "hooked MediaCoordinator$1.shouldFilterOut");
+            // 防止该方法被调用方内联导致回调不触发
+            log(Log.INFO, TAG, "deoptimize shouldFilterOut -> " + deoptimize(shouldFilterOut));
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "hook statusbar media icon failed: " + t);
+        }
+    }
+
+    /** 在类及其父类中查找字段（含父类）。 */
+    private static Field findField(Class<?> cls, String name) {
+        Class<?> c = cls;
+        while (c != null) {
+            try {
+                return c.getDeclaredField(name);
+            } catch (NoSuchFieldException ignored) {
+                c = c.getSuperclass();
+            }
+        }
+        return null;
     }
 
     /**
