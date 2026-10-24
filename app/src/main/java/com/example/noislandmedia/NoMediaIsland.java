@@ -181,7 +181,10 @@ public class NoMediaIsland extends XposedModule {
         // (4) 停用 3.0.3 的 MIUI 卡（miui_media_session.xml），改走 2.0.212 的标准卡
         hookDisableMiuiMediaCard(cl);
 
-        // (5) 隐藏 App 裸通知那一行（行仍渲染→状态栏图标保留）
+        // (5) 从数据入口断掉「媒体上岛」，让系统回落到标准轮播（MediaCarouselController）
+        hookBlockIslandDataIntake(cl);
+
+        // (6) 隐藏 App 裸通知那一行（行仍渲染→状态栏图标保留）
         hookHideRawMediaRow(cl);
     }
 
@@ -351,6 +354,44 @@ public class NoMediaIsland extends XposedModule {
             } catch (Throwable t) {
                 log(Log.WARN, TAG, "disable MIUI media card failed: " + spec[1] + " (" + t + ")");
             }
+        }
+    }
+
+    /**
+     * 从<b>数据入口</b>断掉媒体上岛，而不只是拦渲染。
+     *
+     * <p>假设：3.0.3 之所以不用标准轮播 {@code MediaCarouselController}，是因为系统判定
+     * 「媒体要上岛」（岛是 HyperOS 3.0 的媒体主入口）。如果只拦渲染，系统状态仍然是“媒体在岛上”，
+     * 标准轮播就不会接管。这里直接拦 {@code MiuiIslandMediaController} 的媒体数据入口
+     * {@code mediaDataChangeListener$1.onMediaDataChanged}，让它根本收不到媒体，
+     * 促使系统回落到标准轮播（支持多会话滑动切换，即 2.0.212 的行为）。
+     */
+    private void hookBlockIslandDataIntake(ClassLoader cl) {
+        try {
+            Class<?> c = Class.forName(
+                    "com.android.systemui.statusbar.notification.mediaisland"
+                            + ".MiuiIslandMediaController$mediaDataChangeListener$1", false, cl);
+            Method m = null;
+            for (Method mm : c.getDeclaredMethods()) {
+                if ("onMediaDataChanged".equals(mm.getName())) {
+                    m = mm;
+                    break;
+                }
+            }
+            if (m == null) {
+                log(Log.WARN, TAG, "island listener onMediaDataChanged not found");
+                return;
+            }
+            hook(m)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept((XposedInterface.Chain chain) -> {
+                        log(Log.INFO, TAG, "[islanddata] block island intake -> fallback to standard carousel");
+                        return null; // void 方法：不 proceed 即阻断
+                    });
+            log(Log.INFO, TAG, "hooked island data intake (blocked)");
+            log(Log.INFO, TAG, "deoptimize island intake -> " + deoptimize(m));
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "block island data intake failed: " + t);
         }
     }
 
