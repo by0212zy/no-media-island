@@ -9,6 +9,21 @@
 > 原理基于对本机 `MiuiSystemUI.apk` 的反编译定位：媒体会话变化、投屏变化、配置重 inflate 三处
 > 最终都调用 `addDynamicIslandView`，因此只要让该方法直接 `return`，媒体就不再上岛。
 
+## v1.1 修复（重要）：为什么 1.0「没反应」
+
+1.0 在 LSPosed 日志里显示 `hooked ...addDynamicIslandView` 成功，但音乐照样上岛。
+根因不是 hook 写错，而是 **ART 编译期内联（inline）**：
+
+- `addDynamicIslandView` 被它的三个调用方
+  `onMediaDataChanged` / `onCastInfoChanged` / `reInflateView$1` 直接内联进了各自的机器码，
+  于是运行期根本不存在「调用 `addDynamicIslandView`」这个动作，hook 回调自然不会被触发
+  （libxposed 文档 `XposedInterface.deoptimize` 明确描述了这一现象）。
+- 修复：在 `onPackageReady` 里对 `addDynamicIslandView` 自身以及上述三个调用方
+  全部执行 `XposedInterface.deoptimize(...)`，强制调用退回为真实方法调用，hook 才会真正生效。
+
+> 若升级后仍无效，请确认：模块作用域已勾选 `com.android.systemui`，且**重启过 SystemUI / 设备**
+> （让 deoptimize 在全新的 SystemUI 进程里生效）。
+
 ## 工作原理
 
 Hook 写法（拦截器链，不调用 `chain.proceed()` 即等价于原方法直接 return）：

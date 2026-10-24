@@ -11,10 +11,16 @@ import java.lang.reflect.Method;
 import java.util.Set;
 
 /**
- * 现代 libxposed 模块（API 102）。
+ * 现代 libxposed 模块（API 101）。
  * 作用：拦截 HyperOS「超级岛 / 通知岛（DynamicIsland）」把媒体渲染成顶部胶囊的唯一汇聚点
  *       {@code MiuiIslandMediaController.addDynamicIslandView(...)}，让媒体不再上岛，
  *       但音乐 App 自身的 MediaStyle 通知仍正常留在通知栏。
+ *
+ * <p>关键修复（v1.1）：本机 MiuiSystemUI 的 {@code addDynamicIslandView} 会被其调用方
+ * （{@code onMediaDataChanged} / {@code onCastInfoChanged} / {@code reInflateView$1}）在 ART 编译期
+ * <b>内联（inline）</b>，导致 hook 回调根本不会被触发（LSPosed 日志虽显示 “hooked” 成功，但方法体不执行）。
+ * 因此必须对这三个调用方（以及方法自身）执行 {@link XposedInterface#deoptimize}，
+ * 强制调用退回为真实方法调用，hook 才会真正生效。详见 libxposed XposedInterface.deoptimize 文档。
  */
 public class NoMediaIsland extends XposedModule {
 
@@ -30,6 +36,23 @@ public class NoMediaIsland extends XposedModule {
             "com.android.systemui.statusbar.notification.mediaisland.MiuiIslandMediaViewHolder",
             "com.android.systemui.statusbar.notification.mediaisland.MiuiIslandMediaViewHolder",
             "com.android.systemui.media.controls.shared.model.MediaData"
+    };
+
+    /**
+     * {@code addDynamicIslandView} 在本机 MiuiSystemUI（classes3.dex）中的全部调用方。
+     * 这些方法是内联热点，必须逐个 deoptimize，否则 hook 回调不触发。
+     * 每项：[类名, 方法名, 参数类型（可空；多个用 ';' 分隔）]。
+     */
+    private static final String[][] CALLERS = {
+            // 媒体数据变化时把媒体送上岛
+            {"com.android.systemui.statusbar.notification.mediaisland.MiuiIslandMediaController$mediaDataChangeListener$1",
+             "onMediaDataChanged", "com.android.systemui.media.controls.shared.model.MediaData"},
+            // 投屏信息变化时
+            {"com.android.systemui.statusbar.notification.mediaisland.MiuiIslandMediaController",
+             "onCastInfoChanged", "java.util.Map"},
+            // 视图重建（如密度/字体变化）后重新上岛
+            {"com.android.systemui.statusbar.notification.mediaisland.MiuiIslandMediaController",
+             "reInflateView$1"},
     };
 
     // ===== 过滤策略 =====
@@ -69,10 +92,35 @@ public class NoMediaIsland extends XposedModule {
                             }
                         }
                         // 不上岛：直接拦截，原方法不再执行
+                        Log.i(TAG, "media blocked from DynamicIsland");
                         return null;
                     });
 
             log(Log.INFO, TAG, "hooked " + TARGET_CLASS + "." + METHOD);
+
+            // ===== 关键修复：去优化调用方，避免内联导致 hook 回调不触发 =====
+            log(Log.INFO, TAG, "deoptimize self=" + deoptimize(hooked));
+            for (String[] spec : CALLERS) {
+                try {
+                    Class<?> cc = Class.forName(spec[0], false, cl);
+                    Class<?>[] cpts;
+                    if (spec.length >= 3 && !spec[2].isEmpty()) {
+                        String[] ps = spec[2].split(";");
+                        cpts = new Class<?>[ps.length];
+                        for (int i = 0; i < ps.length; i++) {
+                            cpts[i] = Class.forName(ps[i], false, cl);
+                        }
+                    } else {
+                        cpts = new Class<?>[0];
+                    }
+                    Method cm = cc.getDeclaredMethod(spec[1], cpts);
+                    boolean ok = deoptimize(cm);
+                    log(Log.INFO, TAG, "deoptimize caller " + spec[0] + "." + spec[1] + " -> " + ok);
+                } catch (Throwable t) {
+                    log(Log.WARN, TAG, "deoptimize caller failed: " + spec[1] + " (" + t + ")");
+                }
+            }
+
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "hook failed: " + t);
         }
