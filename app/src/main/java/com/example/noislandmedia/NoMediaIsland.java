@@ -189,6 +189,9 @@ public class NoMediaIsland extends XposedModule {
 
         // (7) 强制标准轮播的宿主可见（探针：MediaHostStateHolder / MediaHost 的 getVisible）
         hookForceCarouselVisible(cl);
+
+        // (8) UI 结构改动：捕获 MediaHost.hostView，并挂进 MediaHierarchyManager.rootView
+        hookCaptureAndAttachHostView(cl);
     }
 
     /**
@@ -430,6 +433,96 @@ public class NoMediaIsland extends XposedModule {
             } catch (Throwable t) {
                 log(Log.WARN, TAG, "force visible failed: " + spec[0] + "." + spec[1] + " (" + t + ")");
             }
+        }
+    }
+
+    /** 捕获到的 MediaHost.hostView（key = MediaHost.location）。 */
+    private static final java.util.Map<Integer, android.view.View> HOST_VIEWS =
+            new java.util.HashMap<>();
+
+    /**
+     * UI 结构改动：把标准轮播的宿主视图挂进媒体挂载容器。
+     *
+     * <p>v1.10 已证明「强制 getVisible」无效，说明轮播的 {@code hostView} 从来没有被加进视图树。
+     * HyperOS 3.0 把媒体挪到岛/MIUI 卡后，这个挂载步骤不再发生。
+     *
+     * <p>做法两步：
+     * <ol>
+     *   <li>hook {@code MediaHost.init(int)}，事后从 {@code hostView} 字段抓出
+     *       {@code UniqueObjectHostView}（轮播真正的容器视图）。</li>
+     *   <li>hook {@code MediaHierarchyManager.updateHostAttachment()}，事后把该视图挂进
+     *       {@code MediaHierarchyManager.rootView}（媒体视图的指定挂载容器）。</li>
+     * </ol>
+     * 全程 try/catch 兜底，任何一步失败都只是「不显示」，不会影响 SystemUI 稳定。
+     */
+    private void hookCaptureAndAttachHostView(ClassLoader cl) {
+        Class<?> hostCls = null;
+        try {
+            hostCls = Class.forName(
+                    "com.android.systemui.media.controls.ui.view.MediaHost", false, cl);
+            final Class<?> hc = hostCls;
+            Method init = hc.getDeclaredMethod("init", int.class);
+            hook(init)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept((XposedInterface.Chain chain) -> {
+                        Object result = chain.proceed();
+                        try {
+                            int loc = (Integer) chain.getArgs().get(0);
+                            Field f = hc.getDeclaredField("hostView");
+                            f.setAccessible(true);
+                            Object hv = f.get(chain.getThisObject());
+                            if (hv instanceof android.view.View) {
+                                HOST_VIEWS.put(loc, (android.view.View) hv);
+                                log(Log.INFO, TAG, "[carousel] captured hostView location=" + loc);
+                            }
+                        } catch (Throwable t) {
+                            log(Log.WARN, TAG, "[carousel] capture failed: " + t);
+                        }
+                        return result;
+                    });
+            log(Log.INFO, TAG, "hooked MediaHost.init (capture hostView)");
+            log(Log.INFO, TAG, "deoptimize MediaHost.init -> " + deoptimize(init));
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "hook MediaHost.init failed: " + t);
+        }
+
+        try {
+            Class<?> mgrCls = Class.forName(
+                    "com.android.systemui.media.controls.ui.controller.MediaHierarchyManager",
+                    false, cl);
+            final Class<?> mc = mgrCls;
+            Method uha = mc.getDeclaredMethod("updateHostAttachment");
+            hook(uha)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept((XposedInterface.Chain chain) -> {
+                        Object result = chain.proceed();
+                        try {
+                            Field rootF = mc.getDeclaredField("rootView");
+                            rootF.setAccessible(true);
+                            Object root = rootF.get(chain.getThisObject());
+                            if (root instanceof android.view.ViewGroup) {
+                                android.view.ViewGroup parent = (android.view.ViewGroup) root;
+                                for (android.view.View hv : HOST_VIEWS.values()) {
+                                    if (hv.getParent() == null) {
+                                        parent.addView(hv,
+                                                new android.widget.FrameLayout.LayoutParams(
+                                                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                                                        android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+                                        log(Log.INFO, TAG, "[carousel] attached hostView into rootView");
+                                    }
+                                }
+                            } else {
+                                log(Log.WARN, TAG, "[carousel] rootView not a ViewGroup: " + root);
+                            }
+                        } catch (Throwable t) {
+                            log(Log.WARN, TAG, "[carousel] attach failed: " + t);
+                        }
+                        return result;
+                    });
+            log(Log.INFO, TAG, "hooked MediaHierarchyManager.updateHostAttachment (attach hostView)");
+            log(Log.INFO, TAG, "deoptimize updateHostAttachment -> " + deoptimize(uha));
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "hook updateHostAttachment failed: " + t);
         }
     }
 
