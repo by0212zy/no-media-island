@@ -12,16 +12,28 @@ android {
         applicationId = "com.example.noislandmedia"
         minSdk = 26
         targetSdk = 36
-        versionCode = 19
-        versionName = "1.19"
+        versionCode = 200
+        versionName = "2.0"
+    }
+
+    signingConfigs {
+        create("release") {
+            // release 签名密钥（keytool 生成；文件不入库，密码仅本机使用）。
+            // 升级模块需沿用同一 keystore，否则无法覆盖安装。
+            storeFile = file("noislandmedia-release.jks")
+            storePassword = "NoMediaIsland2026"
+            keyAlias = "noisland"
+            keyPassword = "NoMediaIsland2026"
+        }
     }
 
     buildTypes {
         release {
-            // 默认不混淆，省心；如需混淆请启用下面两行，并在 proguard-rules.pro 中保留 README 规则
             isMinifyEnabled = false
-            // isMinifyEnabled = true
-            // proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("release")
+        }
+        debug {
+            isMinifyEnabled = false
         }
     }
 
@@ -45,4 +57,11 @@ android {
 dependencies {
     // 现代 libxposed API（仅编译期需要，运行期由框架提供）
     compileOnly("io.github.libxposed:api:101.0.1")
+
+    // 设置界面（标准 Preference 页）
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.preference:preference:1.2.1")
+
+    // libxposed 远程偏好：App 侧（设置界面）写入，Hook 侧（SystemUI）读取
+    implementation("io.github.libxposed:service:101.0.0")
 }

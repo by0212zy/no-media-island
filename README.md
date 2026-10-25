@@ -1,104 +1,80 @@
 # NoMediaIsland（音乐不上超级岛 · libxposed 模块）
 
-一个基于现代 **libxposed API（io.github.libxposed:api:102.0.0）** 的 Xposed / LSPosed 模块。
+一个基于现代 **libxposed API（io.github.libxposed:api:101.0.1）** 的 Xposed / LSPosed 模块，
+面向 **HyperOS 3.0.3（Android 15）** 实测调校。
 
-作用：拦截 HyperOS「超级岛 / 通知岛（DynamicIsland）」把媒体渲染成顶部胶囊的**唯一汇聚点**
-`MiuiIslandMediaController.addDynamicIslandView(...)`，让音乐（及所有媒体）不再上岛，
-但**音乐 App 自身的 MediaStyle 通知仍正常留在通知栏**（两条独立通道，互不干扰）。
+作用：拦截 HyperOS「超级岛 / 通知岛（DynamicIsland）」把媒体渲染成顶部胶囊的逻辑，
+让音乐（及所有媒体）不再上岛，同时**音乐 App 自身的 MediaStyle 通知仍正常留在通知栏**。
 
-> 原理基于对本机 `MiuiSystemUI.apk` 的反编译定位：媒体会话变化、投屏变化、配置重 inflate 三处
-> 最终都调用 `addDynamicIslandView`，因此只要让该方法直接 `return`，媒体就不再上岛。
+## 功能（v2.0 全部可在设置界面开关）
 
-## v1.1 修复（重要）：为什么 1.0「没反应」
+安装模块后，桌面会出现 **NoMediaIsland** 图标，点进去是标准设置页。所有开关即时生效（无需重启 SystemUI）：
 
-1.0 在 LSPosed 日志里显示 `hooked ...addDynamicIslandView` 成功，但音乐照样上岛。
-根因不是 hook 写错，而是 **ART 编译期内联（inline）**：
+| 功能 | 默认 | 说明 |
+| --- | --- | --- |
+| 阻止媒体上超级岛 | 开 | 拦截媒体进入灵动岛/超级岛，音乐改用自身播放通知显示 |
+| 音乐 App 显示状态栏图标 | 开 | 播放时在状态栏显示网易云音乐/QQ音乐等应用图标 |
+| 媒体卡横滑切换 | 开 | 通知栏媒体卡片上左右横滑，切换上一个/下一个媒体会话（同时播放多个 App 时有用） |
+| 显示页码指示点 | 开 | 多个媒体会话时，卡片底部显示当前第几页的小圆点 |
+| 隐藏原始媒体通知行 | 开 | 折叠通知栏里多余的原始媒体通知行，避免重复（不影响状态栏图标） |
+| 仅对列表内应用生效 | 关 | 开启后仅处理下面列表中的应用；默认对所有应用生效 |
 
-- `addDynamicIslandView` 被它的三个调用方
-  `onMediaDataChanged` / `onCastInfoChanged` / `reInflateView$1` 直接内联进了各自的机器码，
-  于是运行期根本不存在「调用 `addDynamicIslandView`」这个动作，hook 回调自然不会被触发
-  （libxposed 文档 `XposedInterface.deoptimize` 明确描述了这一现象）。
-- 修复：在 `onPackageReady` 里对 `addDynamicIslandView` 自身以及上述三个调用方
-  全部执行 `XposedInterface.deoptimize(...)`，强制调用退回为真实方法调用，hook 才会真正生效。
+「生效应用列表」一行一个包名，内置：
 
-> 若升级后仍无效，请确认：模块作用域已勾选 `com.android.systemui`，且**重启过 SystemUI / 设备**
-> （让 deoptimize 在全新的 SystemUI 进程里生效）。
-
-## 工作原理
-
-Hook 写法（拦截器链，不调用 `chain.proceed()` 即等价于原方法直接 return）：
-
-```java
-hook(hooked)
-    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-    .intercept((XposedInterface.Chain chain) -> {
-        if (ONLY_BLOCK_LISTED) {
-            Object mediaData = chain.getArgs().get(2); // 第三个参数即 MediaData
-            String pkg = readPackageName(mediaData);
-            if (pkg == null || !BLOCKED_PACKAGES.contains(pkg)) {
-                return chain.proceed(); // 不在名单内，照常上岛
-            }
-        }
-        return null; // 不调用 proceed → 媒体不上岛
-    });
 ```
-
-## 过滤策略
-
-默认 `ONLY_BLOCK_LISTED = false`：把所有媒体都挡在「超级岛」之外。
-
-若只想排除特定几个音乐 App、其余媒体仍上岛，请把 `NoMediaIsland.java` 中：
-
-```java
-private static final boolean ONLY_BLOCK_LISTED = false;
-private static final Set<String> BLOCKED_PACKAGES = Set.of(
-        "com.netease.cloudmusic",   // 网易云音乐
-        "com.tencent.qqmusic"       // QQ 音乐
-);
+com.netease.cloudmusic
+com.tencent.qqmusic
 ```
-
-改为 `ONLY_BLOCK_LISTED = true` 并填好包名即可（已内置通过反射读取 `MediaData.packageName`）。
-
-## 构建
-
-- 需要 **Android SDK（compileSdk 36 / build-tools 35.0.0+）** 与 **JDK 17+**。
-- 依赖 `io.github.libxposed:api:101.0.1`（aar 要求 `compileSdk ≥ 36`）。
-- 本项目自带 Gradle 8.10.2 wrapper（AGP 8.7.0 兼容 Gradle 8.9–8.11，不兼容 Gradle 9）。
-- 用 Android Studio 打开根目录直接构建，或在命令行：
-
-```bash
-export ANDROID_HOME=/path/to/android-sdk
-./gradlew assembleDebug        # 生成未签名的模块 APK
-```
-
-> 关于版本：libxposed API 最新稳定版是 `102.0.0`，但它的 aar 要求 `compileSdk ≥ 37`
-> （需本地装有 `android-37` 平台）。本仓库默认用 `101.0.1`（`minCompileSdk = 36`）以保证在只装到
-> `android-36` 的 SDK 上也能编译。若你的 SDK 已含 android-37，把 `app/build.gradle.kts` 里的
-> `api:101.0.1` 改回 `api:102.0.0`、`compileSdk/targetSdk` 改回 `37`、`module.prop` 改回 `101→102`
-> 即可，模块源码无需任何改动（两个版本的 Hook API 完全一致）。
-
-产物在 `app/build/outputs/apk/debug/app-debug.apk`。
 
 ## 安装与使用
 
 1. 设备已安装 **LSPosed**（或支持 libxposed 的框架）。
-2. 安装构建出的模块 APK。
-3. LSPosed 中把本模块**作用域勾选 `com.android.systemui`**（SystemUI）。
+2. 安装 `v2.0-NoMediaIsland-release.apk`。
+3. LSPosed 中把本模块**作用域勾选 `com.android.systemui`**（仓库内 `META-INF/xposed/scope.list` 已静态声明）。
 4. 重启 SystemUI / 设备。
-5. 播放音乐：顶部「超级岛」不再出现媒体胶囊，通知栏仍能看到音乐 App 自己的播放通知。
+5. 打开桌面上的 **NoMediaIsland** 图标进入设置界面，按需开关功能。
+6. 播放音乐：顶部「超级岛」不再出现媒体胶囊，通知栏仍能看到音乐 App 自己的播放通知；
+   同时播放两个音乐 App 时，在通知栏媒体卡片上左右横滑即可切换。
 
-> 入口与元数据（现代 libxposed 规范，非旧版 `assets/xposed_init`）：
-> - `META-INF/xposed/java_init.list` → 入口类全名
-> - `META-INF/xposed/scope.list` → `com.android.systemui`
-> - `META-INF/xposed/module.prop` → `minApiVersion=102 / targetApiVersion=102 / staticScope=true`
+> 模块未激活时设置界面会提示；激活后界面与 Hook 通过 libxposed Remote Preferences
+> 实时同步（group = `noisland_settings`），改开关不需要重启。
 
-## 配套产物说明
+## 工作原理
 
-本仓库是「运行时 Hook 模块」。另有一份**重编 SystemUI 的改法**（不依赖 LSPosed）：
-对 `MiuiSystemUI.apk` 的 `classes3.dex` 中 `MiuiIslandMediaController.addDynamicIslandView`
-首条指令改为 `return-void`，回编 + 平台签名后刷入。详见随附的《音乐播放器不上超级岛-修改方案.md》。
+- **阻止上岛**：`MiuiIslandMediaController.addDynamicIslandView(3参)` 与真正落岛的接口
+  `DynamicIslandContent.addDynamicIslandView / updateDynamicIslandView` 双保险拦截，
+  并对调用方 `deoptimize` 防止 ART 内联导致回调不触发；
+  同时拦掉 `mediaDataChangeListener$1.onMediaDataChanged` 数据入口，双保险确保岛不出现。
+- **状态栏图标**：hook `MediaCoordinator$1.shouldFilterOut`，对媒体通知强制返回 `false`，
+  使音乐 App 图标不被抽走到「背景图标区」，正常显示在状态栏。
+- **横滑切换**：hook `MiuiMediaViewController.attach` 拿到卡片 View，注册
+  `MediaDataManager.Listener` 收集全部会话，在 `View.dispatchTouchEvent` 上以整卡根容器
+  的屏幕坐标做几何命中（封面/标题/进度条/按钮任意位置可滑），横滑时调用
+  `bindMediaData(另一个会话)` 完成切换；进度条区域只拖动不切卡。
+- **页码指示点**：把 SystemUI 原生 `com.android.systemui.qs.PageIndicator` 作为 overlay
+  挂在卡片 FrameLayout 底部（不撑高卡片、不产生空白），会话 <2 时自动隐藏。
+- **隐藏原始通知行**：媒体行 `getIntrinsicHeight` 返回 0 + `onAttachedToWindow` 置 GONE +
+  兜底拦截 `setVisibility(VISIBLE)`，彻底消除折叠残留占位。
+
+## 构建
+
+- 需要 **Android SDK（compileSdk 36）** 与 **JDK 17+**。
+- 依赖 `io.github.libxposed:api:101.0.1`（aar 要求 `compileSdk ≥ 36`）。
+- 本项目自带 Gradle 8.10.2 wrapper（AGP 8.7.0）。
+
+```bash
+export ANDROID_HOME=/path/to/android-sdk
+./gradlew assembleRelease   # 生成已签名的正式版 APK
+```
+
+产物在 `app/build/outputs/apk/release/app-release.apk`，复制为
+`v2.0-NoMediaIsland-release.apk` 即可发布。
+
+> Release 签名使用本地生成的 keystore（`app/noislandmedia-release.jks`，**不入库**）。
+> 自行构建发布时请在 `app/build.gradle.kts` 的 `signingConfigs.release` 里换成你自己的密钥；
+> 升级已安装模块必须沿用同一 keystore，否则无法覆盖安装。
 
 ## 免责声明
 
-- 结论基于静态反编译定位 + DEX 可解析校验 + 模块源码编译校验，真机效果请自测。
-- 修改系统组件 / 刷机有风险，操作前请备份数据。
+- 结论基于静态反编译定位 + 真机（HyperOS 3.0.3）实测，其它机型/版本效果请自测。
+- 修改系统组件有风险，操作前请备份数据。

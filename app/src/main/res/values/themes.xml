@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.NoMediaIsland" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="colorPrimary">#FF0F1419</item>
+        <item name="colorPrimaryDark">#FF0F1419</item>
+        <item name="colorAccent">#FF3ED6C3</item>
+        <item name="android:windowBackground">#FF0F1419</item>
+        <item name="android:statusBarColor">#FF0F1419</item>
+        <item name="android:navigationBarColor">#FF0F1419</item>
+        <item name="android:textColorPrimary">#FFFFFFFF</item>
+    </style>
+
+</resources>

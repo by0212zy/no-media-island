@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NoMediaIsland 设置页
+-->
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <PreferenceCategory android:title="@string/cat_island">
+
+        <SwitchPreferenceCompat
+            android:key="block_island"
+            android:title="@string/block_island_title"
+            android:summary="@string/block_island_summary"
+            android:defaultValue="true"
+            app:iconSpaceReserved="false" />
+
+    </PreferenceCategory>
+
+    <PreferenceCategory android:title="@string/cat_statusbar">
+
+        <SwitchPreferenceCompat
+            android:key="status_icon"
+            android:title="@string/status_icon_title"
+            android:summary="@string/status_icon_summary"
+            android:defaultValue="true"
+            app:iconSpaceReserved="false" />
+
+    </PreferenceCategory>
+
+    <PreferenceCategory android:title="@string/cat_card">
+
+        <SwitchPreferenceCompat
+            android:key="card_swipe"
+            android:title="@string/card_swipe_title"
+            android:summary="@string/card_swipe_summary"
+            android:defaultValue="true"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            android:key="indicator"
+            android:title="@string/indicator_title"
+            android:summary="@string/indicator_summary"
+            android:defaultValue="true"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            android:key="hide_raw"
+            android:title="@string/hide_raw_title"
+            android:summary="@string/hide_raw_summary"
+            android:defaultValue="true"
+            app:iconSpaceReserved="false" />
+
+    </PreferenceCategory>
+
+    <PreferenceCategory android:title="@string/cat_advanced">
+
+        <SwitchPreferenceCompat
+            android:key="only_listed"
+            android:title="@string/only_listed_title"
+            android:summary="@string/only_listed_summary"
+            android:defaultValue="false"
+            app:iconSpaceReserved="false" />
+
+        <EditTextPreference
+            android:key="packages"
+            android:title="@string/packages_title"
+            android:summary="@string/packages_summary"
+            android:dialogTitle="@string/packages_title"
+            android:dialogMessage="@string/packages_dialog"
+            android:inputType="textMultiLine"
+            android:minLines="3"
+            app:iconSpaceReserved="false" />
+
+    </PreferenceCategory>
+
+</PreferenceScreen>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 媒体胶囊外形 -->
+    <path
+        android:fillColor="#3ED6C3"
+        android:pathData="M34,38 h40 a12,12 0 0 1 12,12 v8 a12,12 0 0 1 -12,12 h-40 a12,12 0 0 1 -12,-12 v-8 a12,12 0 0 1 12,-12 z" />
+    <!-- 播放三角 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M48,44 L66,54 L48,64 Z" />
+</vector>

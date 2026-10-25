@@ -2,4 +2,34 @@
 <resources>
     <string name="app_name">NoMediaIsland</string>
     <string name="xposed_description">屏蔽音乐等媒体进入 HyperOS「超级岛 / 通知岛」，让音乐 App 使用自身播放通知（通知栏媒体卡片不受影响）。</string>
+
+    <!-- 设置界面 -->
+    <string name="settings_title">NoMediaIsland 设置</string>
+
+    <string name="cat_island">超级岛</string>
+    <string name="block_island_title">阻止媒体上超级岛</string>
+    <string name="block_island_summary">拦截媒体会话进入 HyperOS 灵动岛/超级岛，音乐将使用自身播放通知显示（默认开）</string>
+
+    <string name="cat_statusbar">状态栏图标</string>
+    <string name="status_icon_title">音乐 App 显示状态栏图标</string>
+    <string name="status_icon_summary">开启后，网易云音乐/QQ音乐等播放时在状态栏显示应用图标（默认开）</string>
+
+    <string name="cat_card">通知栏媒体卡片</string>
+    <string name="card_swipe_title">媒体卡横滑切换</string>
+    <string name="card_swipe_summary">在媒体卡片上左右横滑，切换上一个/下一个媒体会话（默认开）</string>
+    <string name="indicator_title">显示页码指示点</string>
+    <string name="indicator_summary">有多个媒体会话时，在卡片底部显示当前第几页的小圆点（默认开）</string>
+    <string name="hide_raw_title">隐藏原始媒体通知行</string>
+    <string name="hide_raw_summary">卡片接管显示后，收起通知栏里多余的原始媒体通知行，避免重复（默认开）</string>
+
+    <string name="cat_advanced">高级</string>
+    <string name="only_listed_title">仅对列表内应用生效</string>
+    <string name="only_listed_summary">关闭时对所有应用生效（默认关）；开启后仅对下面列表中的应用生效</string>
+    <string name="packages_title">生效应用列表</string>
+    <string name="packages_summary">「仅对列表内应用生效」开启时，只有这些应用的媒体会被处理；一行一个包名</string>
+    <string name="packages_dialog">每行一个应用包名，例如：\ncom.netease.cloudmusic\ncom.tencent.qqmusic</string>
+
+    <string name="save">保存</string>
+    <string name="cancel">取消</string>
+    <string name="hint_module_inactive">未连接到模块服务，请先在 LSPosed 中激活本模块并重启 SystemUI</string>
 </resources>

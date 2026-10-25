@@ -24,6 +24,11 @@ captures/
 # Local configuration file (sdk path, etc)
 local.properties
 
+# Signing keys / keystores (never commit)
+*.jks
+*.keystore
+keystore.properties
+
 # Log/OS Files
 *.log
 
