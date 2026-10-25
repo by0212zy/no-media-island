@@ -31,7 +31,12 @@
     <string name="packages_summary">「仅对列表内应用生效」开启时，只有这些应用的媒体会被处理；一行一个包名</string>
     <string name="packages_dialog">每行一个应用包名，例如：\ncom.netease.cloudmusic\ncom.tencent.qqmusic</string>
 
+    <string name="cat_about">说明</string>
+
     <string name="save">保存</string>
     <string name="cancel">取消</string>
     <string name="hint_module_inactive">未连接到模块服务，请先在 LSPosed 中激活本模块并重启 SystemUI</string>
+    <string name="restart_hint">已保存，重启 SystemUI 后生效</string>
+    <string name="restart_note_title">生效方式</string>
+    <string name="restart_note_summary">开关在 SystemUI 启动时读取，修改后需重启 SystemUI 才能生效（重启方法见应用说明/README）。关闭的功能不会加载任何钩子，不占用系统资源。</string>
 </resources>

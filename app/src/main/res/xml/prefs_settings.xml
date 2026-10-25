@@ -80,4 +80,15 @@
 
     </PreferenceCategory>
 
+    <PreferenceCategory android:title="@string/cat_about">
+
+        <Preference
+            android:key="restart_note"
+            android:title="@string/restart_note_title"
+            android:summary="@string/restart_note_summary"
+            android:selectable="false"
+            app:iconSpaceReserved="false" />
+
+    </PreferenceCategory>
+
 </PreferenceScreen>

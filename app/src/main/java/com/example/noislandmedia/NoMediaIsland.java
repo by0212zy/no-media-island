@@ -79,9 +79,12 @@ import java.util.Set;
  *   <li>only_listed / packages：仅对列表内应用生效 + 生效应用列表（默认全应用）</li>
  * </ul>
  *
- * <p>v2.1：所有功能钩子常驻注册、拦截器实时读开关——设置界面勾选后<b>即时生效</b>，
- * 无需重启 SystemUI；新增「隐藏系统媒体卡片」；移除本机必然失败的死 hook
- * （DynamicIslandContent 抽象方法无法 hook）。
+ * <p>v2.2：设置开关在 SystemUI 启动时读取一次，按开关状态<b>条件注册</b>钩子——
+ * 关闭的功能完全不注册（方法走原生路径，运行时零额外开销），开启的功能钩子常驻。
+ * 修改开关后需<b>重启 SystemUI</b> 生效（设置界面保存时有提示，重启方法见 README）。
+ * 相比 v2.1 的「钩子常驻 + 实时门控」，本方案无论开关开还是关，运行时成本都与
+ * 未安装模块时一致（v2.1 中即使开关关闭，被 hook 的方法每次被调用仍会有一次
+ * LSPosed 分发开销；v2.2 彻底消除）。
  */
 public class NoMediaIsland extends XposedModule {
 
@@ -112,10 +115,10 @@ public class NoMediaIsland extends XposedModule {
              "reInflateView$1"},
     };
 
-    // ===== 设置（remote preferences，App 界面与 Hook 实时共享）=====
+    // ===== 设置（remote preferences，App 界面写入、Hook 启动时读取）=====
     /** remote preferences 实例（可能为 null：模块未激活/服务不可用时用默认值）。 */
     private static volatile SharedPreferences prefs = null;
-    /** 各开关缓存值（变化监听里刷新，钩子热路径只读缓存，不走 IPC）。 */
+    /** 各开关缓存值（SystemUI 启动时读一次，之后不变；改开关需重启生效）。 */
     private static volatile boolean vBlockIsland = Prefs.DEF_BLOCK_ISLAND;
     private static volatile boolean vStatusIcon = Prefs.DEF_STATUS_ICON;
     private static volatile boolean vCardSwipe = Prefs.DEF_CARD_SWIPE;
@@ -126,17 +129,204 @@ public class NoMediaIsland extends XposedModule {
     private static volatile Set<String> vBlockedPkgs =
             new java.util.HashSet<>(Prefs.parsePackages(Prefs.DEF_PACKAGES));
 
-    /** 读取 remote preferences 并注册变化监听（ Hook 进程启动时调用一次）。 */
+    // ===== 钩子注册策略（v2.2：启动时按开关条件注册）=====
+    /**
+     * 设计说明（v2.2，取代 v2.1 的「实时门控」）：设置开关只在 SystemUI 启动时读取一次，
+     * 按开关状态<b>条件注册</b>钩子——
+     * <ul>
+     *   <li>开关关闭的功能：对应钩子<b>完全不注册</b>，方法走原生路径，运行时零额外开销；</li>
+     *   <li>开关开启的功能：钩子常驻注册，拦截器内保留开关/名单判断作为双保险。</li>
+     * </ul>
+     * 修改开关后需要<b>重启 SystemUI 生效</b>（设置界面保存时会提示）。
+     * 这样无论开关开还是关，运行时的成本都与「未安装本模块」完全一致，
+     * 不存在常驻钩子被无效调用时浪费的那一点分发开销。
+     */
+    /** 解析后的钩子方法（onPackageReady 一次性反射获取）。 */
+    private static Method mDispatchTouchEvent = null;
+    private static Method mRowIntrinsicHeight = null;
+    private static Method mRowOnAttach = null;
+    private static Method mRowGetEntry = null;
+    private static Method mIsMediaNotification = null;
+    private static Method mViewSetVisibility = null;
+
+    // ===== 拦截器（注册时复用同一实例）=====
+    /** 横滑手势：挂在 {@code View.dispatchTouchEvent}，按身份限定只处理媒体卡。 */
+    private final XposedInterface.Hooker touchHooker = (XposedInterface.Chain chain) -> {
+        View self = (View) chain.getThisObject();
+        if (self == null) {
+            return chain.proceed();
+        }
+        // 双保险：横滑开关关闭时本钩子根本不会注册，这里防止极端竞态
+        if (!vCardSwipe) {
+            return chain.proceed();
+        }
+        MotionEvent ev = (MotionEvent) chain.getArgs().get(0);
+        int action = ev.getActionMasked();
+        try {
+                if (action == MotionEvent.ACTION_DOWN) {
+                // 进度条区域不触发切换手势，保留原生拖动调进度。
+                // 关键（v1.27）：必须按「屏幕坐标是否落在真实进度条矩形内」判断，
+                // 而不能按 view 子树判断——否则卡片根容器（含进度条后代）会被整体
+                // 误判成进度条，导致封面/标题/空白等不可点击区域全部无法切卡
+                // （只有按钮这种叶子可点击 view 能滑，正是这个 bug 的表现）。
+                if (isPointOnSeekBar(ev)) {
+                    gestureOnCard = false;
+                    gestureOnSeek = true;
+                    return chain.proceed();
+                }
+                gestureOnSeek = false;
+                // 命中测试：以整卡根容器的屏幕边界判定手指是否落在卡内
+                // （覆盖封面/标题/进度条/按钮全部区域，对兄弟子树布局同样稳健）。
+                gestureOnCard = isInsideCardGeometry(self, ev);
+                if (gestureOnCard) {
+                    gestureDownX = ev.getRawX();
+                    gestureDownY = ev.getRawY();
+                    gestureDecided = false;
+                    gestureHorizontal = false;
+                    gestureSwitched = false;
+                    log(Log.INFO, TAG, "[switcher] gesture down on card (geom)");
+                }
+                return chain.proceed();
+            }
+            if (!gestureOnCard) {
+                return chain.proceed();
+            }
+            switch (action) {
+                case MotionEvent.ACTION_MOVE: {
+                    float dx = ev.getRawX() - gestureDownX;
+                    float dy = ev.getRawY() - gestureDownY;
+                    float density =
+                            self.getResources().getDisplayMetrics().density;
+                    float slop = 6f * density;
+                    if (!gestureDecided) {
+                        if (Math.max(Math.abs(dx), Math.abs(dy)) < slop) break;
+                        gestureDecided = true;
+                        gestureHorizontal = Math.abs(dx) > Math.abs(dy) * 1.2f;
+                    }
+                    if (gestureHorizontal) {
+                        // 阻止通知行的侧滑清除/父容器抢走这次手势：
+                        // 对整卡根容器的父节点 disallow（参考 HyperLyric 的 headerParent 思路），
+                        // 比只对 self 的父节点更可靠。
+                        ViewParent blockParent = (mediaCardRoot != null
+                                && mediaCardRoot.getParent() != null)
+                                ? mediaCardRoot.getParent()
+                                : (self.getParent() != null
+                                        ? self.getParent() : null);
+                        if (blockParent != null) {
+                            blockParent.requestDisallowInterceptTouchEvent(true);
+                        }
+                        // 滑到阈值立刻切换（更跟手），每次手势只切一次
+                        if (!gestureSwitched) {
+                            float threshold = Math.max(
+                                    self.getWidth() * 0.08f, 24f * density);
+                            if (Math.abs(dx) > threshold) {
+                                switchSession(dx < 0 ? 1 : -1,
+                                        cardViewController, cardBindMethod);
+                                gestureSwitched = true;
+                            }
+                        }
+                        return Boolean.TRUE; // 消费掉，后续事件继续由我们处理
+                    }
+                    break;
+                }
+
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL: {
+                    if (gestureHorizontal && !gestureOnSeek) {
+                        // 关键：滑动后必须消费掉 UP，
+                        // 否则事件被卡片当成「点击」→ 打开下一个媒体卡片的 App
+                        // 同时释放对父容器的 disallow，让后续手势恢复正常
+                        if (mediaCardRoot != null
+                                && mediaCardRoot.getParent() != null) {
+                            mediaCardRoot.getParent()
+                                    .requestDisallowInterceptTouchEvent(false);
+                        }
+                        gestureDecided = false;
+                        gestureHorizontal = false;
+                        gestureSwitched = false;
+                        gestureOnSeek = false;
+                        return Boolean.TRUE;
+                    }
+                    gestureDecided = false;
+                    gestureHorizontal = false;
+                    gestureSwitched = false;
+                    gestureOnSeek = false;
+                    break;
+                }
+
+                default:
+                    return Boolean.TRUE;
+            }
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "[switcher] gesture error: " + t);
+        }
+        return chain.proceed();
+    };
+
+    /** 隐藏原始媒体通知行 - 主手段：媒体行高度置 0（行仍在管线里，状态栏图标不受影响）。 */
+    private final XposedInterface.Hooker rowHeightHooker = (XposedInterface.Chain chain) -> {
+        if (isMediaRow(chain.getThisObject(), mRowGetEntry, mIsMediaNotification)) {
+            return 0; // 折叠为 0 高度 → 界面上看不见
+        }
+        return chain.proceed();
+    };
+
+    /** 隐藏原始媒体通知行 - 附加手段：附加到窗口时直接 GONE（不 hook setVisibility，避免递归）。 */
+    private final XposedInterface.Hooker rowAttachHooker = (XposedInterface.Chain chain) -> {
+        Object row = chain.getThisObject();
+        Object result = chain.proceed();
+        try {
+            if (isMediaRow(row, mRowGetEntry, mIsMediaNotification)) {
+                android.view.View.class
+                        .getMethod("setVisibility", int.class)
+                        .invoke(row, android.view.View.GONE);
+                log(Log.INFO, TAG, "[row] hide raw media row (GONE)");
+            }
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "[rowvisibility] " + t);
+        }
+        return result;
+    };
+
+    /**
+     * 隐藏原始媒体通知行 - 兜底：媒体行被外部布局重新 setVisible(VISIBLE) 时强制保持 GONE，
+     * 彻底消除「折叠但残留占位」造成的卡片下方空白（随会话数 1→2→3 倍增的根因）。
+     * 仅对 ExpandableNotificationRow 子类做判断，避免全局每个 View 都走反射。
+     */
+    private final XposedInterface.Hooker rowVisibilityHooker = (XposedInterface.Chain chain) -> {
+        Object view = chain.getThisObject();
+        List<Object> args = chain.getArgs();
+        int vis = (args != null && !args.isEmpty() && args.get(0) instanceof Integer)
+                ? (int) args.get(0) : android.view.View.VISIBLE;
+        try {
+            if (vis != android.view.View.GONE
+                    && view instanceof android.view.View
+                    && view.getClass().getName().contains("ExpandableNotificationRow")
+                    && isMediaRow(view, mRowGetEntry, mIsMediaNotification)) {
+                // 递归进入本 hook：第二次 vis==GONE 会正常 proceed，不会死循环
+                ((android.view.View) view).setVisibility(android.view.View.GONE);
+                return null;
+            }
+        } catch (Throwable ignored) {
+        }
+        return chain.proceed();
+    };
+
+    /**
+     * 读取 remote preferences（SystemUI 启动时调用一次，之后不再监听变化）。
+     *
+     * <p>v2.2 起改为「重启生效」策略：开关值只在启动时读一次，据此决定注册哪些钩子；
+     * 运行中修改设置不热更新，需重启 SystemUI 后才会按新值重新注册。
+     */
     private void initPrefs() {
         try {
             prefs = getRemotePreferences(Prefs.GROUP);
             if (prefs != null) {
-                prefs.registerOnSharedPreferenceChangeListener((sp, key) -> reloadPrefs());
                 reloadPrefs();
-                log(Log.INFO, TAG, "prefs ready: block_island=" + vBlockIsland
-                        + " status_icon=" + vStatusIcon + " card_swipe=" + vCardSwipe
-                        + " indicator=" + vIndicator + " hide_raw=" + vHideRaw
-                        + " hide_miuicard=" + vHideMiuiCard
+                log(Log.INFO, TAG, "prefs ready (restart to apply changes): block_island="
+                        + vBlockIsland + " status_icon=" + vStatusIcon
+                        + " card_swipe=" + vCardSwipe + " indicator=" + vIndicator
+                        + " hide_raw=" + vHideRaw + " hide_miuicard=" + vHideMiuiCard
                         + " only_listed=" + vOnlyListed);
             } else {
                 log(Log.WARN, TAG, "remote prefs unavailable, use defaults");
@@ -146,7 +336,7 @@ public class NoMediaIsland extends XposedModule {
         }
     }
 
-    /** 把 remote preferences 的当前值刷进缓存字段。 */
+    /** 把 remote preferences 的当前值刷进缓存字段（启动时调用一次）。 */
     private static void reloadPrefs() {
         SharedPreferences sp = prefs;
         if (sp == null) {
@@ -172,85 +362,103 @@ public class NoMediaIsland extends XposedModule {
         ClassLoader cl = param.getClassLoader();
         initPrefs();
 
-        // 设计说明（v2.1）：所有功能钩子<b>常驻注册一次</b>，每个拦截器第一行先读设置缓存
-        // （volatile boolean，开销可忽略），关闭时直接 proceed。这样任何开关在设置界面
-        // 勾选后都即时生效，不需要重启 SystemUI。
+        // 设计说明（v2.2）：设置开关在 SystemUI 启动时读取一次（initPrefs），
+        // 按开关状态<b>条件注册</b>钩子——关闭的功能完全不注册钩子（方法走原生路径，
+        // 运行时零额外开销），开启的功能钩子常驻。修改开关后需<b>重启 SystemUI</b>
+        // 才会按新值重新注册（设置界面保存时有提示）。
         // 注：早期版本还 hook 过落岛接口 DynamicIslandContent.add/updateDynamicIslandView
         // 作为「双保险」，但本机（HyperOS 3.0.3）实测必报 "Cannot hook abstract methods"
         // （接口抽象方法无法 hook），属无用 hook，已移除。
 
-        // (1) 阻止媒体上超级岛：入口级 hook + 调用方去优化（防 ART 内联）
-        try {
-            Class<?> target = Class.forName(TARGET_CLASS, false, cl);
-            Class<?>[] pts = new Class<?>[PARAM_TYPES.length];
-            for (int i = 0; i < PARAM_TYPES.length; i++) {
-                pts[i] = Class.forName(PARAM_TYPES[i], false, cl);
-            }
-            Method hooked = target.getDeclaredMethod(METHOD, pts);
-
-            // 入口级 hook：直接拦截 addDynamicIslandView(3 参)
-            hook(hooked)
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .intercept((XposedInterface.Chain chain) -> {
-                        if (!vBlockIsland) {
-                            return chain.proceed();
-                        }
-                        if (vOnlyListed) {
-                            Object mediaData = chain.getArgs().get(2);
-                            String pkg = readPackageName(mediaData);
-                            if (pkg == null || !vBlockedPkgs.contains(pkg)) {
-                                return chain.proceed();
-                            }
-                        }
-                        log(Log.INFO, TAG, "[3arg] media blocked from DynamicIsland");
-                        return null;
-                    });
-
-            log(Log.INFO, TAG, "hooked " + TARGET_CLASS + "." + METHOD);
-
-            // ===== 去优化，避免内联导致回调不触发 =====
-            log(Log.INFO, TAG, "deoptimize self=" + deoptimize(hooked));
-            for (String[] spec : CALLERS) {
-                try {
-                    Class<?> cc = Class.forName(spec[0], false, cl);
-                    Class<?>[] cpts;
-                    if (spec.length >= 3 && !spec[2].isEmpty()) {
-                        String[] ps = spec[2].split(";");
-                        cpts = new Class<?>[ps.length];
-                        for (int i = 0; i < ps.length; i++) {
-                            cpts[i] = Class.forName(ps[i], false, cl);
-                        }
-                    } else {
-                        cpts = new Class<?>[0];
-                    }
-                    Method cm = cc.getDeclaredMethod(spec[1], cpts);
-                    log(Log.INFO, TAG, "deoptimize caller " + spec[1] + " -> " + deoptimize(cm));
-                } catch (Throwable t) {
-                    log(Log.WARN, TAG, "deoptimize caller failed: " + spec[1] + " (" + t + ")");
+        // (1) 阻止媒体上超级岛：入口级 hook + 数据入口 hook + 调用方去优化（防 ART 内联）
+        if (vBlockIsland) {
+            try {
+                Class<?> target = Class.forName(TARGET_CLASS, false, cl);
+                Class<?>[] pts = new Class<?>[PARAM_TYPES.length];
+                for (int i = 0; i < PARAM_TYPES.length; i++) {
+                    pts[i] = Class.forName(PARAM_TYPES[i], false, cl);
                 }
+                Method hooked = target.getDeclaredMethod(METHOD, pts);
+
+                // 入口级 hook：直接拦截 addDynamicIslandView(3 参)
+                hook(hooked)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept((XposedInterface.Chain chain) -> {
+                            if (vOnlyListed) {
+                                Object mediaData = chain.getArgs().get(2);
+                                String pkg = readPackageName(mediaData);
+                                if (pkg == null || !vBlockedPkgs.contains(pkg)) {
+                                    return chain.proceed();
+                                }
+                            }
+                            log(Log.INFO, TAG, "[3arg] media blocked from DynamicIsland");
+                            return null;
+                        });
+
+                log(Log.INFO, TAG, "hooked " + TARGET_CLASS + "." + METHOD);
+
+                // ===== 去优化，避免内联导致回调不触发 =====
+                log(Log.INFO, TAG, "deoptimize self=" + deoptimize(hooked));
+                for (String[] spec : CALLERS) {
+                    try {
+                        Class<?> cc = Class.forName(spec[0], false, cl);
+                        Class<?>[] cpts;
+                        if (spec.length >= 3 && !spec[2].isEmpty()) {
+                            String[] ps = spec[2].split(";");
+                            cpts = new Class<?>[ps.length];
+                            for (int i = 0; i < ps.length; i++) {
+                                cpts[i] = Class.forName(ps[i], false, cl);
+                            }
+                        } else {
+                            cpts = new Class<?>[0];
+                        }
+                        Method cm = cc.getDeclaredMethod(spec[1], cpts);
+                        log(Log.INFO, TAG, "deoptimize caller " + spec[1] + " -> " + deoptimize(cm));
+                    } catch (Throwable t) {
+                        log(Log.WARN, TAG, "deoptimize caller failed: " + spec[1] + " (" + t + ")");
+                    }
+                }
+            } catch (Throwable t) {
+                log(Log.ERROR, TAG, "hook failed: " + t);
             }
-        } catch (Throwable t) {
-            log(Log.ERROR, TAG, "hook failed: " + t);
+
+            // (1b) 从数据入口断掉「媒体上岛」（双保险，确保岛不出现）
+            hookBlockIslandDataIntake(cl);
+        } else {
+            log(Log.INFO, TAG, "block_island=off: island hooks not registered");
         }
 
         // (2) 状态栏音乐图标：让媒体通知不被从状态栏图标列表抽走
-        hookStatusBarMediaIcon(cl);
-
-        // (3) 从数据入口断掉「媒体上岛」（双保险，确保岛不出现）
-        hookBlockIslandDataIntake(cl);
+        if (vStatusIcon) {
+            hookStatusBarMediaIcon(cl);
+        } else {
+            log(Log.INFO, TAG, "status_icon=off: shouldFilterOut hook not registered");
+        }
 
         // (4) 隐藏 HyperOS 自带的「系统风格媒体卡」（MiuiMediaNotificationController）
-        hookHideMiuiMediaCard(cl);
+        if (vHideMiuiCard) {
+            hookHideMiuiMediaCard(cl);
+        } else {
+            log(Log.INFO, TAG, "hide_miuicard=off: miui media card hooks not registered");
+        }
 
         // (5) 隐藏 App 裸通知那一行（行仍渲染→状态栏图标保留）
-        //     「隐藏系统媒体卡片」开启时不停用本钩子，由 isMediaRow 动态判断：
+        //     「隐藏系统媒体卡片」开启时不停用本组钩子（启动时按组合决定是否注册）：
         //     系统卡隐藏期间始终显示 App 自己的通知，避免下拉栏没有媒体卡。
-        hookHideRawMediaRow(cl);
+        if (vHideRaw && !vHideMiuiCard) {
+            hookHideRawMediaRow(cl);
+        } else {
+            log(Log.INFO, TAG, "hide_raw=off or hide_miuicard=on: row hooks not registered");
+        }
 
-        // (6) 多媒体卡片横滑切换：在 MIUI 媒体卡上左右滑动切换不同音乐 App 的会话
-        //     dispatchTouchEvent 拦截器第一行检查 vCardSwipe；
-        //     指示器挂载/更新检查 vIndicator；系统卡隐藏时卡片不会 attach，自然停用。
-        hookMediaCardSwitcher(cl);
+        // (6) 多媒体卡片横滑切换 + 页码指示点：在 MIUI 媒体卡上左右滑动切换不同音乐 App 的会话
+        //     两个开关任意一个开启都需要本组钩子（会话收集/卡片登记），
+        //     其中 dispatchTouchEvent 仅在横滑开关开启时注册。
+        if (vCardSwipe || vIndicator) {
+            hookMediaCardSwitcher(cl);
+        } else {
+            log(Log.INFO, TAG, "card_swipe=off and indicator=off: switcher hooks not registered");
+        }
     }
 
     /**
@@ -281,9 +489,6 @@ public class NoMediaIsland extends XposedModule {
             hook(shouldFilterOut)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept((XposedInterface.Chain chain) -> {
-                        if (!vStatusIcon) {
-                            return chain.proceed(); // 开关关闭：恢复原生过滤行为
-                        }
                         Object entry = chain.getArgs().get(0);
                         try {
                             // NotificationEntry.mSbn : StatusBarNotification (实际为 ExpandedNotification 子类)
@@ -312,19 +517,19 @@ public class NoMediaIsland extends XposedModule {
     }
 
     /**
-     * 停用 3.0.3 独有的「系统媒体卡」组件 {@code MiuiMediaNotificationController}，
-     * 忠实复刻 2.0.212（该版本<b>根本不存在</b>此组件，也没有媒体岛）。
+     * 隐藏 App 裸通知那一行（行仍渲染→状态栏图标保留）。
      *
-     * <p>为什么不是「隐藏通知行」：v1.5 尝试跳过 {@code NotificationRowBinderImpl.inflateViews}
-     * 来隐藏原始通知行，实测<b>状态栏图标也随之消失</b>——图标与行渲染是绑定的，无法这样解耦。
-     * 所以改为从源头停掉 3.0.3 新增的那个系统卡组件本身：它拿不到媒体数据就不会渲染，
-     * 于是只剩音乐 App 自己的通知 + 状态栏图标，即 2.0.212 的效果。
+     * <p>注意不是「跳过 inflateViews 隐藏行」：v1.5 实测那样做<b>状态栏图标也会随之消失</b>——
+     * 图标与行渲染是绑定的，无法解耦。所以这里让行继续存在于通知管线（图标不受影响），
+     * 仅把它的高度折叠为 0 并保持 GONE，视觉上消失但不影响状态栏图标。
      *
-     * <p>拦截它的两个数据入口（void 方法不 proceed 即阻断）：
-     * <ul>
-     *   <li>{@code MiuiMediaNotificationController$mediaDataListener$1.onMediaDataLoaded}</li>
-     *   <li>{@code MiuiMediaNotificationController$MediaDataChangeListener.onMediaDataChanged}</li>
-     * </ul>
+     * <p>三管齐下（均在 hide_raw 开启且 hide_miuicard 关闭时注册，v2.2 启动时决定）：
+     * <ol>
+     *   <li>{@code getIntrinsicHeight} 返回 0：折叠为 0 高度；</li>
+     *   <li>{@code onAttachedToWindow} 时直接 GONE；</li>
+     *   <li>{@code View.setVisibility} 兜底：被外部重新置 VISIBLE 时强制保持 GONE，
+     *       消除「折叠但残留占位」的空白。</li>
+     * </ol>
      */
     private void hookHideRawMediaRow(ClassLoader cl) {
         try {
@@ -335,68 +540,31 @@ public class NoMediaIsland extends XposedModule {
                     "android.service.notification.StatusBarNotification", false, cl);
             Class<?> mdmCls = Class.forName(
                     "com.android.systemui.media.controls.domain.pipeline.MediaDataManager", false, cl);
-            Method isMedia = mdmCls.getDeclaredMethod("isMediaNotification", sbnCls);
-            Method getEntry = rowCls.getMethod("getEntry");
+            mIsMediaNotification = mdmCls.getDeclaredMethod("isMediaNotification", sbnCls);
+            mRowGetEntry = rowCls.getMethod("getEntry");
+            mRowIntrinsicHeight = rowCls.getDeclaredMethod("getIntrinsicHeight");
+            mRowOnAttach = rowCls.getDeclaredMethod("onAttachedToWindow");
+            mViewSetVisibility = android.view.View.class.getDeclaredMethod("setVisibility", int.class);
 
             // 1) 主手段：媒体行高度置 0（持久生效；行仍在管线里，状态栏图标不受影响）
-            Method getH = rowCls.getDeclaredMethod("getIntrinsicHeight");
-            hook(getH)
+            hook(mRowIntrinsicHeight)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .intercept((XposedInterface.Chain chain) -> {
-                        if (isMediaRow(chain.getThisObject(), getEntry, isMedia)) {
-                            return 0; // 折叠为 0 高度 → 界面上看不见
-                        }
-                        return chain.proceed();
-                    });
+                    .intercept(rowHeightHooker);
             log(Log.INFO, TAG, "hooked ExpandableNotificationRow.getIntrinsicHeight (collapse media row)");
-            log(Log.INFO, TAG, "deoptimize getIntrinsicHeight -> " + deoptimize(getH));
+            log(Log.INFO, TAG, "deoptimize getIntrinsicHeight -> " + deoptimize(mRowIntrinsicHeight));
 
             // 2) 附加手段：附加到窗口时直接 GONE（不 hook setVisibility，避免递归）
-            Method onAttach = rowCls.getDeclaredMethod("onAttachedToWindow");
-            hook(onAttach)
+            hook(mRowOnAttach)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .intercept((XposedInterface.Chain chain) -> {
-                        Object row = chain.getThisObject();
-                        Object result = chain.proceed();
-                        try {
-                            if (isMediaRow(row, getEntry, isMedia)) {
-                                android.view.View.class
-                                        .getMethod("setVisibility", int.class)
-                                        .invoke(row, android.view.View.GONE);
-                                log(Log.INFO, TAG, "[row] hide raw media row (GONE)");
-                            }
-                        } catch (Throwable t) {
-                            log(Log.WARN, TAG, "[rowvisibility] " + t);
-                        }
-                        return result;
-                    });
+                    .intercept(rowAttachHooker);
             log(Log.INFO, TAG, "hooked ExpandableNotificationRow.onAttachedToWindow");
-            log(Log.INFO, TAG, "deoptimize onAttachedToWindow -> " + deoptimize(onAttach));
+            log(Log.INFO, TAG, "deoptimize onAttachedToWindow -> " + deoptimize(mRowOnAttach));
 
             // 3) 兜底：媒体行被外部布局重新 setVisible(VISIBLE) 时强制保持 GONE，
             //    彻底消除“折叠但残留占位”造成的卡片下方空白（随会话数 1→2→3 倍增的根因）。
-            //    仅对 ExpandableNotificationRow 子类做判断，避免全局每个 View 都走反射。
-            Method setVis = android.view.View.class.getDeclaredMethod("setVisibility", int.class);
-            hook(setVis)
+            hook(mViewSetVisibility)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .intercept((XposedInterface.Chain chain) -> {
-                        Object view = chain.getThisObject();
-                        List<Object> args = chain.getArgs();
-                        int vis = (args != null && !args.isEmpty() && args.get(0) instanceof Integer)
-                                ? (int) args.get(0) : android.view.View.VISIBLE;
-                        try {
-                            if (vis != android.view.View.GONE
-                                    && view instanceof android.view.View
-                                    && view.getClass().getName().contains("ExpandableNotificationRow")
-                                    && isMediaRow(view, getEntry, isMedia)) {
-                                // 递归进入本 hook：第二次 vis==GONE 会正常 proceed，不会死循环
-                                ((android.view.View) view).setVisibility(android.view.View.GONE);
-                                return null;
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                        return chain.proceed();
-                    });
+                    .intercept(rowVisibilityHooker);
             log(Log.INFO, TAG, "hooked View.setVisibility (keep media row GONE, no residue)");
         } catch (Throwable t) {
             log(Log.WARN, TAG, "hook hide raw media row failed: " + t);
@@ -431,9 +599,6 @@ public class NoMediaIsland extends XposedModule {
             hook(m)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept((XposedInterface.Chain chain) -> {
-                        if (!vBlockIsland) {
-                            return chain.proceed(); // 开关关闭：媒体照常入岛
-                        }
                         // 「仅对列表内应用生效」开启时：不在名单内的媒体照常入岛
                         if (vOnlyListed) {
                             Object md = (chain.getArgs() != null && !chain.getArgs().isEmpty())
@@ -465,9 +630,9 @@ public class NoMediaIsland extends XposedModule {
      * 控制器拿不到媒体数据就不渲染卡片，通知栏改为显示音乐 App 自己的播放通知
      * （HyperOS 2.0.212 的效果）。开启后横滑切换/页码指示点随卡片一同消失。
      *
-     * <p>拦截器实时读 {@link #vHideMiuiCard}：设置界面勾选后即时生效，无需重启 SystemUI。
-     * 「仅对列表内应用生效」开启时从调用参数里找 MediaData/NotificationEntry 读包名，
-     * 不在名单内的媒体照常显示系统卡。
+     * <p>v2.2：仅当 {@code hide_miuicard} 开关开启时才注册本组钩子（启动时决定），
+     * 关闭时完全不注册。「仅对列表内应用生效」开启时从调用参数里找
+     * MediaData/NotificationEntry 读包名，不在名单内的媒体照常显示系统卡。
      */
     private void hookHideMiuiMediaCard(ClassLoader cl) {
         String[][] specs = {
@@ -494,9 +659,7 @@ public class NoMediaIsland extends XposedModule {
                 hook(m)
                         .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                         .intercept((XposedInterface.Chain chain) -> {
-                            if (!vHideMiuiCard) {
-                                return chain.proceed(); // 开关关闭：照常显示系统卡
-                            }
+                            // 「仅对列表内应用生效」开启时：不在名单内的媒体照常显示系统卡
                             if (vOnlyListed) {
                                 String pkg = null;
                                 List<Object> args = chain.getArgs();
@@ -688,7 +851,10 @@ public class NoMediaIsland extends XposedModule {
             // 2b) 手势拦截：挂在 View.dispatchTouchEvent，按身份限定只处理这张媒体卡。
             //     这样卡片内任意子 View（封面/进度条/按钮）上的滑动都能捕获，
             //     不会出现 DOWN 被子 View 吃掉而收不到 MOVE 的情况。
-            hookViewDispatchTouch();
+            //     v2.2：仅横滑开关开启时注册；关闭时不注册（触摸分发零额外开销）。
+            if (vCardSwipe) {
+                hookViewDispatchTouch();
+            }
 
             // 3) bindMediaData：记录当前正在控制的会话
             hook(bindMediaData)
@@ -1223,126 +1389,16 @@ public class NoMediaIsland extends XposedModule {
     }
 
     /**
-     * 挂 {@code View.dispatchTouchEvent} 用命中测试处理整张媒体卡的手势。
+     * 挂 {@code View.dispatchTouchEvent} 用命中测试处理整张媒体卡的手势（v2.2：仅横滑开关开启时调用）。
      * 卡片内任意子 View 上的触摸都会作为 self 经过本钩子；命中卡内后，
      * 本次手势的 MOVE/UP 均按横向滑动处理（滑到子 View 也不丢手势）。
      */
     private void hookViewDispatchTouch() {
         try {
-            Method dte = View.class.getDeclaredMethod("dispatchTouchEvent", MotionEvent.class);
-            hook(dte)
+            mDispatchTouchEvent = View.class.getDeclaredMethod("dispatchTouchEvent", MotionEvent.class);
+            hook(mDispatchTouchEvent)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .intercept((XposedInterface.Chain chain) -> {
-                        View self = (View) chain.getThisObject();
-                        if (self == null) {
-                            return chain.proceed();
-                        }
-                        // 横滑开关关闭：直接放行（volatile 读，开销可忽略）
-                        if (!vCardSwipe) {
-                            return chain.proceed();
-                        }
-                        MotionEvent ev = (MotionEvent) chain.getArgs().get(0);
-                        int action = ev.getActionMasked();
-                        try {
-                                if (action == MotionEvent.ACTION_DOWN) {
-                                // 进度条区域不触发切换手势，保留原生拖动调进度。
-                                // 关键（v1.27）：必须按「屏幕坐标是否落在真实进度条矩形内」判断，
-                                // 而不能按 view 子树判断——否则卡片根容器（含进度条后代）会被整体
-                                // 误判成进度条，导致封面/标题/空白等不可点击区域全部无法切卡
-                                // （只有按钮这种叶子可点击 view 能滑，正是这个 bug 的表现）。
-                                if (isPointOnSeekBar(ev)) {
-                                    gestureOnCard = false;
-                                    gestureOnSeek = true;
-                                    return chain.proceed();
-                                }
-                                gestureOnSeek = false;
-                                // 命中测试：以整卡根容器的屏幕边界判定手指是否落在卡内
-                                // （覆盖封面/标题/进度条/按钮全部区域，对兄弟子树布局同样稳健）。
-                                gestureOnCard = isInsideCardGeometry(self, ev);
-                                if (gestureOnCard) {
-                                    gestureDownX = ev.getRawX();
-                                    gestureDownY = ev.getRawY();
-                                    gestureDecided = false;
-                                    gestureHorizontal = false;
-                                    gestureSwitched = false;
-                                    log(Log.INFO, TAG, "[switcher] gesture down on card (geom)");
-                                }
-                                return chain.proceed();
-                            }
-                            if (!gestureOnCard) {
-                                return chain.proceed();
-                            }
-                            switch (action) {
-                                case MotionEvent.ACTION_MOVE: {
-                                    float dx = ev.getRawX() - gestureDownX;
-                                    float dy = ev.getRawY() - gestureDownY;
-                                    float density =
-                                            self.getResources().getDisplayMetrics().density;
-                                    float slop = 6f * density;
-                                    if (!gestureDecided) {
-                                        if (Math.max(Math.abs(dx), Math.abs(dy)) < slop) break;
-                                        gestureDecided = true;
-                                        gestureHorizontal = Math.abs(dx) > Math.abs(dy) * 1.2f;
-                                    }
-                                    if (gestureHorizontal) {
-                                        // 阻止通知行的侧滑清除/父容器抢走这次手势：
-                                        // 对整卡根容器的父节点 disallow（参考 HyperLyric 的 headerParent 思路），
-                                        // 比只对 self 的父节点更可靠。
-                                        ViewParent blockParent = (mediaCardRoot != null
-                                                && mediaCardRoot.getParent() != null)
-                                                ? mediaCardRoot.getParent()
-                                                : (self.getParent() != null
-                                                        ? self.getParent() : null);
-                                        if (blockParent != null) {
-                                            blockParent.requestDisallowInterceptTouchEvent(true);
-                                        }
-                                        // 滑到阈值立刻切换（更跟手），每次手势只切一次
-                                        if (!gestureSwitched) {
-                                            float threshold = Math.max(
-                                                    self.getWidth() * 0.08f, 24f * density);
-                                            if (Math.abs(dx) > threshold) {
-                                                switchSession(dx < 0 ? 1 : -1,
-                                                        cardViewController, cardBindMethod);
-                                                gestureSwitched = true;
-                                            }
-                                        }
-                                        return Boolean.TRUE; // 消费掉，后续事件继续由我们处理
-                                    }
-                                    break;
-                                }
-
-                                case MotionEvent.ACTION_UP:
-                                case MotionEvent.ACTION_CANCEL: {
-                                    if (gestureHorizontal && !gestureOnSeek) {
-                                        // 关键：滑动后必须消费掉 UP，
-                                        // 否则事件被卡片当成「点击」→ 打开下一个媒体卡片的 App
-                                        // 同时释放对父容器的 disallow，让后续手势恢复正常
-                                        if (mediaCardRoot != null
-                                                && mediaCardRoot.getParent() != null) {
-                                            mediaCardRoot.getParent()
-                                                    .requestDisallowInterceptTouchEvent(false);
-                                        }
-                                        gestureDecided = false;
-                                        gestureHorizontal = false;
-                                        gestureSwitched = false;
-                                        gestureOnSeek = false;
-                                        return Boolean.TRUE;
-                                    }
-                                    gestureDecided = false;
-                                    gestureHorizontal = false;
-                                    gestureSwitched = false;
-                                    gestureOnSeek = false;
-                                    break;
-                                }
-
-                                default:
-                                    return Boolean.TRUE;
-                            }
-                        } catch (Throwable t) {
-                            log(Log.WARN, TAG, "[switcher] gesture error: " + t);
-                        }
-                        return chain.proceed();
-                    });
+                    .intercept(touchHooker);
             log(Log.INFO, TAG, "hooked View.dispatchTouchEvent (media card swipe)");
         } catch (Throwable t) {
             log(Log.WARN, TAG, "hook dispatchTouchEvent failed: " + t);

@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.noislandmedia"
         minSdk = 26
         targetSdk = 36
-        versionCode = 210
-        versionName = "2.1"
+        versionCode = 220
+        versionName = "2.2"
     }
 
     signingConfigs {

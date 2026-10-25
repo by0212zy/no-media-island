@@ -3,6 +3,7 @@ package com.example.noislandmedia;
 import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.text.TextUtils;
+import android.widget.Toast;
 
 import androidx.annotation.Nullable;
 import androidx.preference.EditTextPreference;
@@ -19,6 +20,9 @@ import androidx.preference.SwitchPreferenceCompat;
  * 而本界面展示的是 remote preferences——不显式写回就会出现
  * 「改了但重开还是默认值」。因此对每个 Preference 都挂
  * {@code setOnPreferenceChangeListener}，把新值写入当前绑定的 prefs。
+ *
+ * <p>v2.2 起改为「重启生效」策略：开关值写入即持久化，但 SystemUI 只在启动时
+ * 读取一次，因此每次保存后提示用户重启 SystemUI（见 {@link #showRestartHint()}）。
  */
 public class SettingsFragment extends PreferenceFragmentCompat
         implements SharedPreferences.OnSharedPreferenceChangeListener {
@@ -44,6 +48,7 @@ public class SettingsFragment extends PreferenceFragmentCompat
      * 勾选/输入即时写入当前绑定的 prefs（remote 优先）。
      * 返回 true 让 androidx 同步自己的状态并写一份本地默认 prefs 作兜底，
      * 模块未激活时本地值仍在，激活后 migration 会补写到 remote。
+     * 保存后提示重启 SystemUI（v2.2：开关只在 SystemUI 启动时读取一次）。
      */
     private void setupWriteListeners() {
         String[] boolKeys = {
@@ -60,6 +65,7 @@ public class SettingsFragment extends PreferenceFragmentCompat
                 if (p != null) {
                     p.edit().putBoolean(preference.getKey(), v).apply();
                 }
+                showRestartHint();
                 return true;
             });
         }
@@ -71,9 +77,16 @@ public class SettingsFragment extends PreferenceFragmentCompat
                 if (p != null) {
                     p.edit().putString(preference.getKey(), v).apply();
                 }
+                showRestartHint();
                 return true;
             });
         }
+    }
+
+    /** 保存成功提示：开关需重启 SystemUI 后生效。 */
+    private void showRestartHint() {
+        if (!isAdded()) return;
+        Toast.makeText(requireContext(), R.string.restart_hint, Toast.LENGTH_SHORT).show();
     }
 
     private void refreshUi() {

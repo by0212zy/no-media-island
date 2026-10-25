@@ -6,9 +6,15 @@
 作用：拦截 HyperOS「超级岛 / 通知岛（DynamicIsland）」把媒体渲染成顶部胶囊的逻辑，
 让音乐（及所有媒体）不再上岛，同时**音乐 App 自身的 MediaStyle 通知仍正常留在通知栏**。
 
-## 功能（v2.1 全部可在设置界面开关）
+## 功能（v2.2 全部可在设置界面开关）
 
-安装模块后，桌面会出现 **NoMediaIsland** 图标，点进去是标准设置页。所有开关即时生效（无需重启 SystemUI）：
+安装模块后，桌面会出现 **NoMediaIsland** 图标，点进去是标准设置页。
+
+> **生效方式（v2.2 起）**：开关值在 SystemUI **启动时读取一次**，修改开关后需要
+> **重启 SystemUI 才能生效**（保存时界面会弹出提示）。这样做的好处是：
+> **关闭的功能完全不加载任何钩子**，运行时成本与未安装模块完全一致——
+> 不存在「钩子常驻、每次方法调用都白跑一次分发」的开销。
+> 如果你更习惯「改完即时生效」，可以用仓库里的 v2.1 版本（钩子常驻 + 实时门控）。
 
 | 功能 | 默认 | 说明 |
 | --- | --- | --- |
@@ -27,22 +33,33 @@ com.netease.cloudmusic
 com.tencent.qqmusic
 ```
 
+## 重启 SystemUI 的方法
+
+修改开关后，任选其一：
+
+- 电脑连接后执行：`adb shell killall com.android.systemui`（最常用，状态栏会重绘，数据不丢）
+- 部分 HyperOS 桌面/快捷设置里有「重启 SystemUI」类工具，亦可使用
+- 直接重启手机（必然生效）
+
 ## 安装与使用
 
 1. 设备已安装 **LSPosed**（或支持 libxposed 的框架）。
-2. 安装 `v2.0-NoMediaIsland-release.apk`。
+2. 安装 `v2.2-NoMediaIsland-release.apk`（与旧版签名一致，可直接覆盖安装）。
 3. LSPosed 中把本模块**作用域勾选 `com.android.systemui`**（仓库内 `META-INF/xposed/scope.list` 已静态声明）。
 4. 重启 SystemUI / 设备。
 5. 打开桌面上的 **NoMediaIsland** 图标进入设置界面，按需开关功能。
 6. 播放音乐：顶部「超级岛」不再出现媒体胶囊，通知栏仍能看到音乐 App 自己的播放通知；
    同时播放两个音乐 App 时，在通知栏媒体卡片上左右横滑即可切换。
+7. **每次修改开关后，按上面「重启 SystemUI 的方法」重启一次**，新设置才会生效。
 
 > 模块未激活时设置界面会提示；激活后界面与 Hook 通过 libxposed Remote Preferences
-> 实时同步（group = `noisland_settings`），改开关不需要重启。
+> 共享数据（group = `noisland_settings`），开关值保存后重启 SystemUI 即应用。
 
 ## 工作原理
 
-- **阻止上岛**：hook `MiuiIslandMediaController.addDynamicIslandView(3参)` 直接拦截，
+钩子按开关**条件注册**（v2.2）：关闭的功能不注册对应钩子，开启的功能常驻注册。
+
+- **阻止上岛**（`block_island`）：hook `MiuiIslandMediaController.addDynamicIslandView(3参)` 直接拦截，
   并对三个调用方（`onMediaDataChanged` / `onCastInfoChanged` / `reInflateView$1`）
   `deoptimize` 防止 ART 内联导致回调不触发；同时拦掉
   `mediaDataChangeListener$1.onMediaDataChanged` 数据入口，双保险确保岛不出现。
@@ -50,16 +67,19 @@ com.tencent.qqmusic
   但本机实测接口抽象方法无法 hook——`Cannot hook abstract methods`，已移除。）
   「仅对列表内应用生效」开启时，上述两处都会读取 MediaData.packageName，
   不在名单内的媒体照常上岛。
-- **状态栏图标**：hook `MediaCoordinator$1.shouldFilterOut`，对媒体通知强制返回 `false`，
+- **状态栏图标**（`status_icon`）：hook `MediaCoordinator$1.shouldFilterOut`，对媒体通知强制返回 `false`，
   使音乐 App 图标不被抽走到「背景图标区」，正常显示在状态栏。
-- **横滑切换**：hook `MiuiMediaViewController.attach` 拿到卡片 View，注册
+- **横滑切换**（`card_swipe`）：hook `MiuiMediaViewController.attach` 拿到卡片 View，注册
   `MediaDataManager.Listener` 收集全部会话，在 `View.dispatchTouchEvent` 上以整卡根容器
   的屏幕坐标做几何命中（封面/标题/进度条/按钮任意位置可滑），横滑时调用
   `bindMediaData(另一个会话)` 完成切换；进度条区域只拖动不切卡。
-- **页码指示点**：把 SystemUI 原生 `com.android.systemui.qs.PageIndicator` 作为 overlay
+- **页码指示点**（`indicator`）：把 SystemUI 原生 `com.android.systemui.qs.PageIndicator` 作为 overlay
   挂在卡片 FrameLayout 底部（不撑高卡片、不产生空白），会话 <2 时自动隐藏。
-- **隐藏原始通知行**：媒体行 `getIntrinsicHeight` 返回 0 + `onAttachedToWindow` 置 GONE +
-  兜底拦截 `setVisibility(VISIBLE)`，彻底消除折叠残留占位。
+- **隐藏原始通知行**（`hide_raw` 且 `hide_miuicard` 关）：媒体行 `getIntrinsicHeight` 返回 0 +
+  `onAttachedToWindow` 置 GONE + 兜底拦截 `setVisibility(VISIBLE)`，彻底消除折叠残留占位。
+- **隐藏系统媒体卡片**（`hide_miuicard`）：拦掉 `MiuiMediaNotificationController` 的两个数据入口
+  （`mediaDataListener$1.onMediaDataLoaded` / `MediaDataChangeListener.onMediaDataChanged`），
+  控制器拿不到数据就不渲染卡片，通知栏改为显示音乐 App 自己的播放通知。
 
 ## 构建
 
@@ -73,11 +93,18 @@ export ANDROID_HOME=/path/to/android-sdk
 ```
 
 产物在 `app/build/outputs/apk/release/app-release.apk`，复制为
-`v2.0-NoMediaIsland-release.apk` 即可发布。
+`v2.2-NoMediaIsland-release.apk` 即可发布。
 
 > Release 签名使用本地生成的 keystore（`app/noislandmedia-release.jks`，**不入库**）。
 > 自行构建发布时请在 `app/build.gradle.kts` 的 `signingConfigs.release` 里换成你自己的密钥；
 > 升级已安装模块必须沿用同一 keystore，否则无法覆盖安装。
+
+## 版本策略说明
+
+- **v2.2（当前）**：启动时条件注册钩子，改开关需重启 SystemUI；运行成本与未装模块一致。
+- **v2.1**：钩子常驻 + 实时门控，改开关即时生效；但即使开关关闭，被 hook 的方法
+  （如 `View.dispatchTouchEvent`）每次被调用仍会有一次 LSPosed 分发开销。
+  在意这点系统开销就用 v2.2，在意即时生效就用 v2.1，功能完全一致。
 
 ## 免责声明
 
