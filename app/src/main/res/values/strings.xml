@@ -15,12 +15,14 @@
     <string name="status_icon_summary">开启后，网易云音乐/QQ音乐等播放时在状态栏显示应用图标（默认开）</string>
 
     <string name="cat_card">通知栏媒体卡片</string>
+    <string name="hide_miuicard_title">隐藏系统媒体卡片</string>
+    <string name="hide_miuicard_summary">隐藏 HyperOS 自带的「系统风格媒体卡」（大封面那张），改为显示音乐 App 自己的播放通知（HyperOS 2.0 的效果）；开启后横滑切换与页码指示点同时失效（默认关）</string>
     <string name="card_swipe_title">媒体卡横滑切换</string>
     <string name="card_swipe_summary">在媒体卡片上左右横滑，切换上一个/下一个媒体会话（默认开）</string>
     <string name="indicator_title">显示页码指示点</string>
     <string name="indicator_summary">有多个媒体会话时，在卡片底部显示当前第几页的小圆点（默认开）</string>
     <string name="hide_raw_title">隐藏原始媒体通知行</string>
-    <string name="hide_raw_summary">卡片接管显示后，收起通知栏里多余的原始媒体通知行，避免重复（默认开）</string>
+    <string name="hide_raw_summary">卡片接管显示后，收起通知栏里多余的原始媒体通知行，避免重复（默认开；「隐藏系统媒体卡片」开启时本开关无效，始终显示 App 自己的通知）</string>
 
     <string name="cat_advanced">高级</string>
     <string name="only_listed_title">仅对列表内应用生效</string>

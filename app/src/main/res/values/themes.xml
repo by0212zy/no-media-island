@@ -1,14 +1,41 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <style name="Theme.NoMediaIsland" parent="Theme.AppCompat.DayNight.NoActionBar">
+    <!--
+      纯暗色主题（不用 DayNight）：
+      之前用 Theme.AppCompat.DayNight + 手动把 windowBackground 改成深色，
+      系统亮色模式下会出现「亮色对话框 + 白色文字 = 白底白字」、
+      「深色窗口 + 暗色次要文字 = 黑底黑字」。
+      固定暗色父主题后，文字/对话框/编辑框颜色全部协调。
+    -->
+    <style name="Theme.NoMediaIsland" parent="Theme.AppCompat.NoActionBar">
         <item name="colorPrimary">#FF0F1419</item>
         <item name="colorPrimaryDark">#FF0F1419</item>
         <item name="colorAccent">#FF3ED6C3</item>
         <item name="android:windowBackground">#FF0F1419</item>
+        <item name="android:colorBackground">#FF0F1419</item>
         <item name="android:statusBarColor">#FF0F1419</item>
         <item name="android:navigationBarColor">#FF0F1419</item>
         <item name="android:textColorPrimary">#FFFFFFFF</item>
+        <item name="android:textColorSecondary">#B3FFFFFF</item>
+        <item name="android:textColorTertiary">#8AFFFFFF</item>
+        <!-- 对话框/编辑框跟随暗色 -->
+        <item name="android:dialogTheme">@style/Theme.NoMediaIsland.Dialog</item>
+        <item name="android:alertDialogTheme">@style/Theme.NoMediaIsland.Dialog</item>
+    </style>
+
+    <style name="Theme.NoMediaIsland.Dialog" parent="ThemeOverlay.AppCompat.Dialog.Alert">
+        <item name="android:colorBackground">#FF1A2230</item>
+        <item name="android:textColorPrimary">#FFFFFFFF</item>
+        <item name="android:textColorSecondary">#B3FFFFFF</item>
+        <item name="colorAccent">#FF3ED6C3</item>
+        <!-- 编辑框：亮文字 + 可见边框，杜绝白底白字 -->
+        <item name="android:editTextStyle">@style/Widget.NoMediaIsland.EditText</item>
+    </style>
+
+    <style name="Widget.NoMediaIsland.EditText" parent="Widget.AppCompat.EditText">
+        <item name="android:textColor">#FFFFFFFF</item>
+        <item name="android:textColorHint">#8AFFFFFF</item>
     </style>
 
 </resources>

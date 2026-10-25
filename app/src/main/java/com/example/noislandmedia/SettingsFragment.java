@@ -48,7 +48,8 @@ public class SettingsFragment extends PreferenceFragmentCompat
     private void setupWriteListeners() {
         String[] boolKeys = {
                 Prefs.KEY_BLOCK_ISLAND, Prefs.KEY_STATUS_ICON, Prefs.KEY_CARD_SWIPE,
-                Prefs.KEY_INDICATOR, Prefs.KEY_HIDE_RAW, Prefs.KEY_ONLY_LISTED,
+                Prefs.KEY_INDICATOR, Prefs.KEY_HIDE_RAW, Prefs.KEY_HIDE_MIUICARD,
+                Prefs.KEY_ONLY_LISTED,
         };
         for (String key : boolKeys) {
             SwitchPreferenceCompat sp = findPreference(key);
@@ -83,6 +84,7 @@ public class SettingsFragment extends PreferenceFragmentCompat
         switchPref(Prefs.KEY_CARD_SWIPE, Prefs.DEF_CARD_SWIPE);
         switchPref(Prefs.KEY_INDICATOR, Prefs.DEF_INDICATOR);
         switchPref(Prefs.KEY_HIDE_RAW, Prefs.DEF_HIDE_RAW);
+        switchPref(Prefs.KEY_HIDE_MIUICARD, Prefs.DEF_HIDE_MIUICARD);
         switchPref(Prefs.KEY_ONLY_LISTED, Prefs.DEF_ONLY_LISTED);
 
         EditTextPreference pkg = findPreference(Prefs.KEY_PACKAGES);

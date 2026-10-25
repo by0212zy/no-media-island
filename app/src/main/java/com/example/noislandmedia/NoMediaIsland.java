@@ -72,11 +72,16 @@ import java.util.Set;
  * <ul>
  *   <li>block_island：阻止媒体上超级岛（默认开）</li>
  *   <li>status_icon：音乐 App 显示状态栏图标（默认开）</li>
+ *   <li>hide_miuicard：隐藏系统媒体卡片，改显 App 自己的播放通知（默认关）</li>
  *   <li>card_swipe：媒体卡横滑切换（默认开）</li>
  *   <li>indicator：显示页码指示点（默认开）</li>
- *   <li>hide_raw：隐藏原始媒体通知行（默认开）</li>
+ *   <li>hide_raw：隐藏原始媒体通知行（默认开；hide_miuicard 开启时无效）</li>
  *   <li>only_listed / packages：仅对列表内应用生效 + 生效应用列表（默认全应用）</li>
  * </ul>
+ *
+ * <p>v2.1：所有功能钩子常驻注册、拦截器实时读开关——设置界面勾选后<b>即时生效</b>，
+ * 无需重启 SystemUI；新增「隐藏系统媒体卡片」；移除本机必然失败的死 hook
+ * （DynamicIslandContent 抽象方法无法 hook）。
  */
 public class NoMediaIsland extends XposedModule {
 
@@ -116,6 +121,7 @@ public class NoMediaIsland extends XposedModule {
     private static volatile boolean vCardSwipe = Prefs.DEF_CARD_SWIPE;
     private static volatile boolean vIndicator = Prefs.DEF_INDICATOR;
     private static volatile boolean vHideRaw = Prefs.DEF_HIDE_RAW;
+    private static volatile boolean vHideMiuiCard = Prefs.DEF_HIDE_MIUICARD;
     private static volatile boolean vOnlyListed = Prefs.DEF_ONLY_LISTED;
     private static volatile Set<String> vBlockedPkgs =
             new java.util.HashSet<>(Prefs.parsePackages(Prefs.DEF_PACKAGES));
@@ -130,6 +136,7 @@ public class NoMediaIsland extends XposedModule {
                 log(Log.INFO, TAG, "prefs ready: block_island=" + vBlockIsland
                         + " status_icon=" + vStatusIcon + " card_swipe=" + vCardSwipe
                         + " indicator=" + vIndicator + " hide_raw=" + vHideRaw
+                        + " hide_miuicard=" + vHideMiuiCard
                         + " only_listed=" + vOnlyListed);
             } else {
                 log(Log.WARN, TAG, "remote prefs unavailable, use defaults");
@@ -150,6 +157,7 @@ public class NoMediaIsland extends XposedModule {
         vCardSwipe = sp.getBoolean(Prefs.KEY_CARD_SWIPE, Prefs.DEF_CARD_SWIPE);
         vIndicator = sp.getBoolean(Prefs.KEY_INDICATOR, Prefs.DEF_INDICATOR);
         vHideRaw = sp.getBoolean(Prefs.KEY_HIDE_RAW, Prefs.DEF_HIDE_RAW);
+        vHideMiuiCard = sp.getBoolean(Prefs.KEY_HIDE_MIUICARD, Prefs.DEF_HIDE_MIUICARD);
         vOnlyListed = sp.getBoolean(Prefs.KEY_ONLY_LISTED, Prefs.DEF_ONLY_LISTED);
         vBlockedPkgs = new java.util.HashSet<>(Prefs.parsePackages(
                 sp.getString(Prefs.KEY_PACKAGES, Prefs.DEF_PACKAGES)));
@@ -164,89 +172,85 @@ public class NoMediaIsland extends XposedModule {
         ClassLoader cl = param.getClassLoader();
         initPrefs();
 
+        // 设计说明（v2.1）：所有功能钩子<b>常驻注册一次</b>，每个拦截器第一行先读设置缓存
+        // （volatile boolean，开销可忽略），关闭时直接 proceed。这样任何开关在设置界面
+        // 勾选后都即时生效，不需要重启 SystemUI。
+        // 注：早期版本还 hook 过落岛接口 DynamicIslandContent.add/updateDynamicIslandView
+        // 作为「双保险」，但本机（HyperOS 3.0.3）实测必报 "Cannot hook abstract methods"
+        // （接口抽象方法无法 hook），属无用 hook，已移除。
+
         // (1) 阻止媒体上超级岛：入口级 hook + 调用方去优化（防 ART 内联）
-        //     注：早期版本还 hook 了落岛接口 DynamicIslandContent.add/updateDynamicIslandView
-        //     作为「双保险」，但本机（HyperOS 3.0.3）实测必报
-        //     "Cannot hook abstract methods"（接口抽象方法无法 hook），属无用 hook，已移除。
-        if (vBlockIsland) {
-            try {
-                Class<?> target = Class.forName(TARGET_CLASS, false, cl);
-                Class<?>[] pts = new Class<?>[PARAM_TYPES.length];
-                for (int i = 0; i < PARAM_TYPES.length; i++) {
-                    pts[i] = Class.forName(PARAM_TYPES[i], false, cl);
-                }
-                Method hooked = target.getDeclaredMethod(METHOD, pts);
-
-                // 入口级 hook：直接拦截 addDynamicIslandView(3 参)
-                hook(hooked)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .intercept((XposedInterface.Chain chain) -> {
-                            if (vOnlyListed) {
-                                Object mediaData = chain.getArgs().get(2);
-                                String pkg = readPackageName(mediaData);
-                                if (pkg == null || !vBlockedPkgs.contains(pkg)) {
-                                    return chain.proceed();
-                                }
-                            }
-                            log(Log.INFO, TAG, "[3arg] media blocked from DynamicIsland");
-                            return null;
-                        });
-
-                log(Log.INFO, TAG, "hooked " + TARGET_CLASS + "." + METHOD);
-
-                // ===== 去优化，避免内联导致回调不触发 =====
-                log(Log.INFO, TAG, "deoptimize self=" + deoptimize(hooked));
-                for (String[] spec : CALLERS) {
-                    try {
-                        Class<?> cc = Class.forName(spec[0], false, cl);
-                        Class<?>[] cpts;
-                        if (spec.length >= 3 && !spec[2].isEmpty()) {
-                            String[] ps = spec[2].split(";");
-                            cpts = new Class<?>[ps.length];
-                            for (int i = 0; i < ps.length; i++) {
-                                cpts[i] = Class.forName(ps[i], false, cl);
-                            }
-                        } else {
-                            cpts = new Class<?>[0];
-                        }
-                        Method cm = cc.getDeclaredMethod(spec[1], cpts);
-                        log(Log.INFO, TAG, "deoptimize caller " + spec[1] + " -> " + deoptimize(cm));
-                    } catch (Throwable t) {
-                        log(Log.WARN, TAG, "deoptimize caller failed: " + spec[1] + " (" + t + ")");
-                    }
-                }
-            } catch (Throwable t) {
-                log(Log.ERROR, TAG, "hook failed: " + t);
+        try {
+            Class<?> target = Class.forName(TARGET_CLASS, false, cl);
+            Class<?>[] pts = new Class<?>[PARAM_TYPES.length];
+            for (int i = 0; i < PARAM_TYPES.length; i++) {
+                pts[i] = Class.forName(PARAM_TYPES[i], false, cl);
             }
-        } else {
-            log(Log.INFO, TAG, "block_island off, skip island hooks");
+            Method hooked = target.getDeclaredMethod(METHOD, pts);
+
+            // 入口级 hook：直接拦截 addDynamicIslandView(3 参)
+            hook(hooked)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept((XposedInterface.Chain chain) -> {
+                        if (!vBlockIsland) {
+                            return chain.proceed();
+                        }
+                        if (vOnlyListed) {
+                            Object mediaData = chain.getArgs().get(2);
+                            String pkg = readPackageName(mediaData);
+                            if (pkg == null || !vBlockedPkgs.contains(pkg)) {
+                                return chain.proceed();
+                            }
+                        }
+                        log(Log.INFO, TAG, "[3arg] media blocked from DynamicIsland");
+                        return null;
+                    });
+
+            log(Log.INFO, TAG, "hooked " + TARGET_CLASS + "." + METHOD);
+
+            // ===== 去优化，避免内联导致回调不触发 =====
+            log(Log.INFO, TAG, "deoptimize self=" + deoptimize(hooked));
+            for (String[] spec : CALLERS) {
+                try {
+                    Class<?> cc = Class.forName(spec[0], false, cl);
+                    Class<?>[] cpts;
+                    if (spec.length >= 3 && !spec[2].isEmpty()) {
+                        String[] ps = spec[2].split(";");
+                        cpts = new Class<?>[ps.length];
+                        for (int i = 0; i < ps.length; i++) {
+                            cpts[i] = Class.forName(ps[i], false, cl);
+                        }
+                    } else {
+                        cpts = new Class<?>[0];
+                    }
+                    Method cm = cc.getDeclaredMethod(spec[1], cpts);
+                    log(Log.INFO, TAG, "deoptimize caller " + spec[1] + " -> " + deoptimize(cm));
+                } catch (Throwable t) {
+                    log(Log.WARN, TAG, "deoptimize caller failed: " + spec[1] + " (" + t + ")");
+                }
+            }
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "hook failed: " + t);
         }
 
-        // (3) 状态栏音乐图标：让媒体通知不被从状态栏图标列表抽走
-        if (vStatusIcon) {
-            hookStatusBarMediaIcon(cl);
-        } else {
-            log(Log.INFO, TAG, "status_icon off, skip statusbar icon hook");
-        }
+        // (2) 状态栏音乐图标：让媒体通知不被从状态栏图标列表抽走
+        hookStatusBarMediaIcon(cl);
 
-        // (4) 从数据入口断掉「媒体上岛」（双保险，确保岛不出现）
-        if (vBlockIsland) {
-            hookBlockIslandDataIntake(cl);
-        }
+        // (3) 从数据入口断掉「媒体上岛」（双保险，确保岛不出现）
+        hookBlockIslandDataIntake(cl);
+
+        // (4) 隐藏 HyperOS 自带的「系统风格媒体卡」（MiuiMediaNotificationController）
+        hookHideMiuiMediaCard(cl);
 
         // (5) 隐藏 App 裸通知那一行（行仍渲染→状态栏图标保留）
-        if (vHideRaw) {
-            hookHideRawMediaRow(cl);
-        } else {
-            log(Log.INFO, TAG, "hide_raw off, keep raw media row visible");
-        }
+        //     「隐藏系统媒体卡片」开启时不停用本钩子，由 isMediaRow 动态判断：
+        //     系统卡隐藏期间始终显示 App 自己的通知，避免下拉栏没有媒体卡。
+        hookHideRawMediaRow(cl);
 
         // (6) 多媒体卡片横滑切换：在 MIUI 媒体卡上左右滑动切换不同音乐 App 的会话
-        if (vCardSwipe) {
-            hookMediaCardSwitcher(cl);
-        } else {
-            log(Log.INFO, TAG, "card_swipe off, skip media card switcher");
-        }
+        //     dispatchTouchEvent 拦截器第一行检查 vCardSwipe；
+        //     指示器挂载/更新检查 vIndicator；系统卡隐藏时卡片不会 attach，自然停用。
+        hookMediaCardSwitcher(cl);
     }
 
     /**
@@ -277,6 +281,9 @@ public class NoMediaIsland extends XposedModule {
             hook(shouldFilterOut)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept((XposedInterface.Chain chain) -> {
+                        if (!vStatusIcon) {
+                            return chain.proceed(); // 开关关闭：恢复原生过滤行为
+                        }
                         Object entry = chain.getArgs().get(0);
                         try {
                             // NotificationEntry.mSbn : StatusBarNotification (实际为 ExpandedNotification 子类)
@@ -424,6 +431,9 @@ public class NoMediaIsland extends XposedModule {
             hook(m)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept((XposedInterface.Chain chain) -> {
+                        if (!vBlockIsland) {
+                            return chain.proceed(); // 开关关闭：媒体照常入岛
+                        }
                         // 「仅对列表内应用生效」开启时：不在名单内的媒体照常入岛
                         if (vOnlyListed) {
                             Object md = (chain.getArgs() != null && !chain.getArgs().isEmpty())
@@ -440,6 +450,77 @@ public class NoMediaIsland extends XposedModule {
             log(Log.INFO, TAG, "deoptimize island intake -> " + deoptimize(m));
         } catch (Throwable t) {
             log(Log.WARN, TAG, "block island data intake failed: " + t);
+        }
+    }
+
+    /**
+     * 隐藏 HyperOS 3.0.3 的「系统风格媒体卡」（{@code MiuiMediaNotificationController}，
+     * 即下拉通知栏里那张带大封面的系统卡）。
+     *
+     * <p>做法：拦掉它自己的两个数据入口（void 方法不 proceed 即阻断）——
+     * <ul>
+     *   <li>{@code MiuiMediaNotificationController$mediaDataListener$1.onMediaDataLoaded}</li>
+     *   <li>{@code MiuiMediaNotificationController$MediaDataChangeListener.onMediaDataChanged}</li>
+     * </ul>
+     * 控制器拿不到媒体数据就不渲染卡片，通知栏改为显示音乐 App 自己的播放通知
+     * （HyperOS 2.0.212 的效果）。开启后横滑切换/页码指示点随卡片一同消失。
+     *
+     * <p>拦截器实时读 {@link #vHideMiuiCard}：设置界面勾选后即时生效，无需重启 SystemUI。
+     * 「仅对列表内应用生效」开启时从调用参数里找 MediaData/NotificationEntry 读包名，
+     * 不在名单内的媒体照常显示系统卡。
+     */
+    private void hookHideMiuiMediaCard(ClassLoader cl) {
+        String[][] specs = {
+                {"com.android.systemui.statusbar.notification.mediacontrol"
+                        + ".MiuiMediaNotificationController$mediaDataListener$1", "onMediaDataLoaded"},
+                {"com.android.systemui.statusbar.notification.mediacontrol"
+                        + ".MiuiMediaNotificationController$MediaDataChangeListener", "onMediaDataChanged"},
+        };
+        for (String[] spec : specs) {
+            try {
+                Class<?> c = Class.forName(spec[0], false, cl);
+                Method m = null;
+                for (Method mm : c.getDeclaredMethods()) {
+                    if (spec[1].equals(mm.getName())) {
+                        m = mm;
+                        break;
+                    }
+                }
+                if (m == null) {
+                    log(Log.WARN, TAG, "miui card method not found: " + spec[1]);
+                    continue;
+                }
+                final String mName = spec[1];
+                hook(m)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept((XposedInterface.Chain chain) -> {
+                            if (!vHideMiuiCard) {
+                                return chain.proceed(); // 开关关闭：照常显示系统卡
+                            }
+                            if (vOnlyListed) {
+                                String pkg = null;
+                                List<Object> args = chain.getArgs();
+                                if (args != null) {
+                                    for (Object a : args) {
+                                        pkg = readAnyPackageName(a);
+                                        if (pkg != null) {
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (pkg == null || !vBlockedPkgs.contains(pkg)) {
+                                    return chain.proceed();
+                                }
+                            }
+                            log(Log.INFO, TAG, "[miuicard] block " + mName + " (hide system media card)");
+                            return null; // void 方法：不 proceed 即阻断
+                        });
+                log(Log.INFO, TAG, "hooked " + spec[0].substring(spec[0].lastIndexOf('.') + 1)
+                        + "." + spec[1] + " (hide system media card)");
+                log(Log.INFO, TAG, "deoptimize " + spec[1] + " -> " + deoptimize(m));
+            } catch (Throwable t) {
+                log(Log.WARN, TAG, "hide miui media card failed: " + spec[1] + " (" + t + ")");
+            }
         }
     }
 
@@ -1156,6 +1237,10 @@ public class NoMediaIsland extends XposedModule {
                         if (self == null) {
                             return chain.proceed();
                         }
+                        // 横滑开关关闭：直接放行（volatile 读，开销可忽略）
+                        if (!vCardSwipe) {
+                            return chain.proceed();
+                        }
                         MotionEvent ev = (MotionEvent) chain.getArgs().get(0);
                         int action = ev.getActionMasked();
                         try {
@@ -1282,6 +1367,8 @@ public class NoMediaIsland extends XposedModule {
             Object sbn = f.get(entry);
             return sbn != null
                     && Boolean.TRUE.equals(isMedia.invoke(null, sbn))
+                    // 系统媒体卡隐藏期间始终显示 App 自己的通知（否则下拉栏会没有媒体卡）
+                    && vHideRaw && !vHideMiuiCard
                     && shouldBlock(sbn);
         } catch (Throwable ignored) {
             return false;
@@ -1337,5 +1424,39 @@ public class NoMediaIsland extends XposedModule {
                 return null;
             }
         }
+    }
+
+    /**
+     * 尽力从任意回调参数里读包名：先按 MediaData 读，再尝试经
+     * NotificationEntry（getSbn()/mSbn 字段）转 StatusBarNotification 读。
+     */
+    private static String readAnyPackageName(Object o) {
+        if (o == null) {
+            return null;
+        }
+        String p = readPackageName(o);
+        if (p != null) {
+            return p;
+        }
+        try {
+            Object sbn = null;
+            try {
+                Method m = o.getClass().getMethod("getSbn");
+                sbn = m.invoke(o);
+            } catch (Throwable ignored) {
+            }
+            if (sbn == null) {
+                Field f = findField(o.getClass(), "mSbn");
+                if (f != null) {
+                    f.setAccessible(true);
+                    sbn = f.get(o);
+                }
+            }
+            if (sbn != null) {
+                p = readPackageName(sbn);
+            }
+        } catch (Throwable ignored) {
+        }
+        return p;
     }
 }

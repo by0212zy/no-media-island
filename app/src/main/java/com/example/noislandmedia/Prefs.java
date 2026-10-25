@@ -20,6 +20,7 @@ public final class Prefs {
     public static final String KEY_CARD_SWIPE   = "card_swipe";     // 媒体卡横滑切换
     public static final String KEY_INDICATOR    = "indicator";      // 显示页码指示点
     public static final String KEY_HIDE_RAW     = "hide_raw";       // 隐藏原始媒体通知行
+    public static final String KEY_HIDE_MIUICARD = "hide_miuicard"; // 隐藏系统媒体卡片
     public static final String KEY_ONLY_LISTED  = "only_listed";    // 仅对列表内应用生效
     public static final String KEY_PACKAGES     = "packages";       // 生效应用列表
 
@@ -29,6 +30,7 @@ public final class Prefs {
     public static final boolean DEF_CARD_SWIPE   = true;
     public static final boolean DEF_INDICATOR    = true;
     public static final boolean DEF_HIDE_RAW     = true;
+    public static final boolean DEF_HIDE_MIUICARD = false;
     public static final boolean DEF_ONLY_LISTED  = false;
     public static final String  DEF_PACKAGES     = "com.netease.cloudmusic\ncom.tencent.qqmusic";
 

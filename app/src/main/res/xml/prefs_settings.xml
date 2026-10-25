@@ -30,6 +30,13 @@
     <PreferenceCategory android:title="@string/cat_card">
 
         <SwitchPreferenceCompat
+            android:key="hide_miuicard"
+            android:title="@string/hide_miuicard_title"
+            android:summary="@string/hide_miuicard_summary"
+            android:defaultValue="false"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
             android:key="card_swipe"
             android:title="@string/card_swipe_title"
             android:summary="@string/card_swipe_summary"
