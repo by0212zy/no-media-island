@@ -94,12 +94,6 @@ public class NoMediaIsland extends XposedModule {
             "com.android.systemui.media.controls.shared.model.MediaData"
     };
 
-    // DynamicIslandContent 接口（真正把任意内容画到岛上的方法所在）
-    private static final String ISLAND_IFACE =
-            "com.android.systemui.plugins.miui.dynamicisland.DynamicIslandContent";
-    private static final String ISLAND_DATA =
-            "com.android.systemui.plugins.miui.dynamicisland.DynamicIslandData";
-
     /**
      * {@code addDynamicIslandView} 在本机 MiuiSystemUI 中的全部调用方，需 deoptimize 以防内联。
      * 每项：[类名, 方法名, 参数类型（可空；多个用 ';' 分隔）]。
@@ -170,7 +164,10 @@ public class NoMediaIsland extends XposedModule {
         ClassLoader cl = param.getClassLoader();
         initPrefs();
 
-        // (1)(2) 阻止媒体上超级岛：入口级 + 落岛接口级双保险（含去优化防内联）
+        // (1) 阻止媒体上超级岛：入口级 hook + 调用方去优化（防 ART 内联）
+        //     注：早期版本还 hook 了落岛接口 DynamicIslandContent.add/updateDynamicIslandView
+        //     作为「双保险」，但本机（HyperOS 3.0.3）实测必报
+        //     "Cannot hook abstract methods"（接口抽象方法无法 hook），属无用 hook，已移除。
         if (vBlockIsland) {
             try {
                 Class<?> target = Class.forName(TARGET_CLASS, false, cl);
@@ -180,7 +177,7 @@ public class NoMediaIsland extends XposedModule {
                 }
                 Method hooked = target.getDeclaredMethod(METHOD, pts);
 
-                // (1) 入口级 hook：直接拦截 addDynamicIslandView(3 参)
+                // 入口级 hook：直接拦截 addDynamicIslandView(3 参)
                 hook(hooked)
                         .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                         .intercept((XposedInterface.Chain chain) -> {
@@ -196,27 +193,6 @@ public class NoMediaIsland extends XposedModule {
                         });
 
                 log(Log.INFO, TAG, "hooked " + TARGET_CLASS + "." + METHOD);
-
-                // (2) 落岛接口级 hook：add / update 都拦，只要调用方是媒体控制器
-                Class<?> iface = Class.forName(ISLAND_IFACE, false, cl);
-                Class<?> did = Class.forName(ISLAND_DATA, false, cl);
-                for (String mName : new String[]{"addDynamicIslandView", "updateDynamicIslandView"}) {
-                    try {
-                        Method im = iface.getMethod(mName, did, boolean.class);
-                        hook(im)
-                                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                                .intercept((XposedInterface.Chain chain) -> {
-                                    if (isMediaCall()) {
-                                        log(Log.INFO, TAG, "[iface." + mName + "] media blocked");
-                                        return null;
-                                    }
-                                    return chain.proceed();
-                                });
-                        log(Log.INFO, TAG, "hooked iface " + ISLAND_IFACE + "." + mName);
-                    } catch (Throwable t) {
-                        log(Log.WARN, TAG, "hook iface " + mName + " failed: " + t);
-                    }
-                }
 
                 // ===== 去优化，避免内联导致回调不触发 =====
                 log(Log.INFO, TAG, "deoptimize self=" + deoptimize(hooked));
@@ -239,15 +215,6 @@ public class NoMediaIsland extends XposedModule {
                         log(Log.WARN, TAG, "deoptimize caller failed: " + spec[1] + " (" + t + ")");
                     }
                 }
-                // 落岛接口方法也尝试去优化（部分 ART 会内联实现体）
-                try {
-                    Method imAdd = iface.getMethod("addDynamicIslandView", did, boolean.class);
-                    log(Log.INFO, TAG, "deoptimize iface.add -> " + deoptimize(imAdd));
-                } catch (Throwable ignored) {}
-                try {
-                    Method imUpd = iface.getMethod("updateDynamicIslandView", did, boolean.class);
-                    log(Log.INFO, TAG, "deoptimize iface.update -> " + deoptimize(imUpd));
-                } catch (Throwable ignored) {}
             } catch (Throwable t) {
                 log(Log.ERROR, TAG, "hook failed: " + t);
             }
@@ -457,6 +424,15 @@ public class NoMediaIsland extends XposedModule {
             hook(m)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                     .intercept((XposedInterface.Chain chain) -> {
+                        // 「仅对列表内应用生效」开启时：不在名单内的媒体照常入岛
+                        if (vOnlyListed) {
+                            Object md = (chain.getArgs() != null && !chain.getArgs().isEmpty())
+                                    ? chain.getArgs().get(0) : null;
+                            String pkg = readPackageName(md);
+                            if (pkg == null || !vBlockedPkgs.contains(pkg)) {
+                                return chain.proceed();
+                            }
+                        }
                         log(Log.INFO, TAG, "[islanddata] block island intake -> fallback to standard carousel");
                         return null; // void 方法：不 proceed 即阻断
                     });
@@ -1340,22 +1316,6 @@ public class NoMediaIsland extends XposedModule {
             }
         }
         return null;
-    }
-
-    /**
-     * 判断当前调用栈是否来自媒体控制器（即本次上岛属于「媒体」）。
-     * 仅当调用方链路中出现 MiuiIslandMediaController 才判为媒体，
-     * 设备通知 / 充电 / 焦点超时等其它岛不受影响。
-     */
-    private static boolean isMediaCall() {
-        StackTraceElement[] st = Thread.currentThread().getStackTrace();
-        for (StackTraceElement e : st) {
-            String cn = e.getClassName();
-            if (cn != null && cn.contains("MiuiIslandMediaController")) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /** 通过反射读取 MediaData 的 packageName（先试 getter，再试字段）。 */

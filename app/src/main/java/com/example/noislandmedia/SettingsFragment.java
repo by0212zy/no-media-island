@@ -13,6 +13,12 @@ import androidx.preference.SwitchPreferenceCompat;
 /**
  * 标准设置页（androidx.preference）。
  * 所有开关直接写入传入的 SharedPreferences（remote 优先，本地兜底）。
+ *
+ * <p>关键（v2.0 修复）：androidx Preference 默认只把勾选持久化到
+ * {@code PreferenceManager.getDefaultSharedPreferences()}（App 本地），
+ * 而本界面展示的是 remote preferences——不显式写回就会出现
+ * 「改了但重开还是默认值」。因此对每个 Preference 都挂
+ * {@code setOnPreferenceChangeListener}，把新值写入当前绑定的 prefs。
  */
 public class SettingsFragment extends PreferenceFragmentCompat
         implements SharedPreferences.OnSharedPreferenceChangeListener {
@@ -22,6 +28,7 @@ public class SettingsFragment extends PreferenceFragmentCompat
     @Override
     public void onCreatePreferences(@Nullable Bundle savedInstanceState, @Nullable String rootKey) {
         setPreferencesFromResource(R.xml.prefs_settings, rootKey);
+        setupWriteListeners();
     }
 
     /** 绑定一份 SharedPreferences（本地或 remote），刷新 UI */
@@ -31,6 +38,41 @@ public class SettingsFragment extends PreferenceFragmentCompat
         prefs = p;
         prefs.registerOnSharedPreferenceChangeListener(this);
         refreshUi();
+    }
+
+    /**
+     * 勾选/输入即时写入当前绑定的 prefs（remote 优先）。
+     * 返回 true 让 androidx 同步自己的状态并写一份本地默认 prefs 作兜底，
+     * 模块未激活时本地值仍在，激活后 migration 会补写到 remote。
+     */
+    private void setupWriteListeners() {
+        String[] boolKeys = {
+                Prefs.KEY_BLOCK_ISLAND, Prefs.KEY_STATUS_ICON, Prefs.KEY_CARD_SWIPE,
+                Prefs.KEY_INDICATOR, Prefs.KEY_HIDE_RAW, Prefs.KEY_ONLY_LISTED,
+        };
+        for (String key : boolKeys) {
+            SwitchPreferenceCompat sp = findPreference(key);
+            if (sp == null) continue;
+            sp.setOnPreferenceChangeListener((preference, newValue) -> {
+                boolean v = Boolean.TRUE.equals(newValue);
+                SharedPreferences p = prefs;
+                if (p != null) {
+                    p.edit().putBoolean(preference.getKey(), v).apply();
+                }
+                return true;
+            });
+        }
+        EditTextPreference pkg = findPreference(Prefs.KEY_PACKAGES);
+        if (pkg != null) {
+            pkg.setOnPreferenceChangeListener((preference, newValue) -> {
+                String v = newValue == null ? "" : (String) newValue;
+                SharedPreferences p = prefs;
+                if (p != null) {
+                    p.edit().putString(preference.getKey(), v).apply();
+                }
+                return true;
+            });
+        }
     }
 
     private void refreshUi() {
@@ -61,7 +103,7 @@ public class SettingsFragment extends PreferenceFragmentCompat
 
     @Override
     public void onSharedPreferenceChanged(SharedPreferences sp, String key) {
-        // remote 变化（极少来自本机双开）时同步刷新
+        // remote 变化（含本界面写入触发的回执）时同步刷新
         refreshUi();
     }
 }

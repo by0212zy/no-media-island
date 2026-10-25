@@ -41,10 +41,14 @@ com.tencent.qqmusic
 
 ## 工作原理
 
-- **阻止上岛**：`MiuiIslandMediaController.addDynamicIslandView(3参)` 与真正落岛的接口
-  `DynamicIslandContent.addDynamicIslandView / updateDynamicIslandView` 双保险拦截，
-  并对调用方 `deoptimize` 防止 ART 内联导致回调不触发；
-  同时拦掉 `mediaDataChangeListener$1.onMediaDataChanged` 数据入口，双保险确保岛不出现。
+- **阻止上岛**：hook `MiuiIslandMediaController.addDynamicIslandView(3参)` 直接拦截，
+  并对三个调用方（`onMediaDataChanged` / `onCastInfoChanged` / `reInflateView$1`）
+  `deoptimize` 防止 ART 内联导致回调不触发；同时拦掉
+  `mediaDataChangeListener$1.onMediaDataChanged` 数据入口，双保险确保岛不出现。
+  （早期版本还 hook 了落岛接口 `DynamicIslandContent.add/updateDynamicIslandView`，
+  但本机实测接口抽象方法无法 hook——`Cannot hook abstract methods`，已移除。）
+  「仅对列表内应用生效」开启时，上述两处都会读取 MediaData.packageName，
+  不在名单内的媒体照常上岛。
 - **状态栏图标**：hook `MediaCoordinator$1.shouldFilterOut`，对媒体通知强制返回 `false`，
   使音乐 App 图标不被抽走到「背景图标区」，正常显示在状态栏。
 - **横滑切换**：hook `MiuiMediaViewController.attach` 拿到卡片 View，注册
